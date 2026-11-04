@@ -58,23 +58,49 @@ END;
 $$;
 
 -- ---------------------------------------------------------------------------
--- 4. Safe Backfill Logic for Existing and NULL entries
---    - Never deletes or overwrites existing data
---    - Matches entries to existing months by date range first
---    - Dynamically calculates the reference month from data / CURRENT_DATE
---    - Ensures an active month exists and associates any orphaned entries
---    - Enforces NOT NULL only once all entries are guaranteed to have a month_id
+-- 4. Safe & Accurate Backfill Logic for Existing and Historical Entries
+--    - Never deletes, truncates, or overwrites existing entries.
+--    - Validates no entries have NULL bazar_date.
+--    - Accurately groups historical entries by their true calendar month.
+--    - Creates closed months for past periods and keeps at most one active month.
+--    - Stops with a descriptive error if any date overlap or ambiguity exists.
+--    - Enforces NOT NULL only when all entries are guaranteed to be mapped.
 -- ---------------------------------------------------------------------------
 DO $$
 DECLARE
-  v_ref_date DATE;
-  v_start_date DATE;
-  v_end_date DATE;
-  v_month_name TEXT;
-  v_target_month_id UUID;
-  v_null_count INTEGER;
+  v_null_date_count INTEGER;
+  v_ambiguous_count INTEGER;
+  v_remaining_null INTEGER;
+  v_has_active_month BOOLEAN;
+  v_latest_unassigned_month DATE;
+  v_new_month_id UUID;
+  v_status TEXT;
+  r RECORD;
 BEGIN
-  -- Step A: If months already exist, match unassigned entries by date range
+  -- Check 1: Ensure no entries have NULL bazar_date
+  SELECT COUNT(*) INTO v_null_date_count
+  FROM bazar_entries
+  WHERE bazar_date IS NULL;
+
+  IF v_null_date_count > 0 THEN
+    RAISE EXCEPTION 'Cannot backfill: % entries have NULL bazar_date. Please populate valid dates before running migration.', v_null_date_count;
+  END IF;
+
+  -- Check 2: Check for ambiguous overlap with multiple existing months
+  SELECT COUNT(*) INTO v_ambiguous_count
+  FROM bazar_entries e
+  WHERE e.month_id IS NULL
+    AND (
+      SELECT COUNT(*)
+      FROM bazar_months m
+      WHERE e.bazar_date >= m.start_date AND e.bazar_date <= m.end_date
+    ) > 1;
+
+  IF v_ambiguous_count > 0 THEN
+    RAISE EXCEPTION 'Ambiguous mapping: % entries match multiple overlapping months in bazar_months. Please resolve overlapping periods manually before running migration.', v_ambiguous_count;
+  END IF;
+
+  -- Step A: If months already exist in bazar_months, assign matching entries by exact date range
   IF EXISTS (SELECT 1 FROM bazar_months LIMIT 1) THEN
     UPDATE bazar_entries e
     SET month_id = m.id
@@ -84,69 +110,91 @@ BEGIN
       AND e.bazar_date <= m.end_date;
   END IF;
 
-  -- Step B: Check if any entries still have month_id IS NULL
-  SELECT COUNT(*) INTO v_null_count
+  -- Step B: For any remaining unassigned entries, group them by their actual historical calendar months
+  SELECT COUNT(*) INTO v_remaining_null
   FROM bazar_entries
   WHERE month_id IS NULL;
 
-  -- If there are NULL entries OR no months exist at all, resolve or create the initial/active month
-  IF v_null_count > 0 OR NOT EXISTS (SELECT 1 FROM bazar_months LIMIT 1) THEN
+  IF v_remaining_null > 0 THEN
+    -- Check if an active month already exists in bazar_months
+    SELECT EXISTS(SELECT 1 FROM bazar_months WHERE status = 'active') INTO v_has_active_month;
 
-    -- Look for an existing active month first
-    SELECT id INTO v_target_month_id
-    FROM bazar_months
-    WHERE status = 'active'
-    ORDER BY created_at DESC
-    LIMIT 1;
+    -- Find the latest unassigned month start date
+    SELECT MAX(date_trunc('month', bazar_date)::DATE) INTO v_latest_unassigned_month
+    FROM bazar_entries
+    WHERE month_id IS NULL;
 
-    -- If no active month exists, determine a safe month dynamically
-    IF v_target_month_id IS NULL THEN
-      -- Pick reference date from latest existing entry, or current date if no entries
-      SELECT COALESCE(MAX(bazar_date), CURRENT_DATE) INTO v_ref_date
-      FROM bazar_entries;
-
-      IF v_ref_date IS NULL THEN
-        v_ref_date := CURRENT_DATE;
+    -- Iterate over each distinct calendar month period among unassigned entries
+    FOR r IN (
+      SELECT DISTINCT
+        date_trunc('month', bazar_date)::DATE as m_start,
+        (date_trunc('month', bazar_date) + INTERVAL '1 month - 1 day')::DATE as m_end,
+        trim(to_char(bazar_date, 'Month YYYY')) as m_name
+      FROM bazar_entries
+      WHERE month_id IS NULL
+      ORDER BY date_trunc('month', bazar_date)::DATE ASC
+    ) LOOP
+      -- Verify this period does not partially overlap with any existing month
+      IF EXISTS (
+        SELECT 1 FROM bazar_months m
+        WHERE NOT (m.end_date < r.m_start OR m.start_date > r.m_end)
+      ) THEN
+        RAISE EXCEPTION 'Ambiguous mapping: historical entries for period % (% to %) conflict with an existing month in bazar_months. Please review month date ranges.', r.m_name, r.m_start, r.m_end;
       END IF;
 
-      v_start_date := date_trunc('month', v_ref_date)::DATE;
-      v_end_date := (date_trunc('month', v_ref_date) + INTERVAL '1 month - 1 day')::DATE;
-      v_month_name := trim(to_char(v_ref_date, 'Month YYYY'));
-
-      -- Check if this specific month already exists as closed
-      SELECT id INTO v_target_month_id
-      FROM bazar_months
-      WHERE start_date = v_start_date AND end_date = v_end_date
-      LIMIT 1;
-
-      -- If it doesn't exist, create it as the active month
-      IF v_target_month_id IS NULL THEN
-        INSERT INTO bazar_months (month_name, start_date, end_date, status)
-        VALUES (v_month_name, v_start_date, v_end_date, 'active')
-        RETURNING id INTO v_target_month_id;
+      -- If no active month exists and this is the latest unassigned month, make it 'active';
+      -- all other historical months must be 'closed'.
+      IF (NOT v_has_active_month) AND (r.m_start = v_latest_unassigned_month) THEN
+        v_status := 'active';
+        v_has_active_month := TRUE;
+      ELSE
+        v_status := 'closed';
       END IF;
-    END IF;
 
-    -- Step C: Assign any remaining NULL entries to the target month
-    IF v_target_month_id IS NOT NULL THEN
+      -- Insert the accurate monthly cycle
+      INSERT INTO bazar_months (month_name, start_date, end_date, status)
+      VALUES (r.m_name, r.m_start, r.m_end, v_status)
+      RETURNING id INTO v_new_month_id;
+
+      -- Associate only the entries belonging to this exact calendar month
       UPDATE bazar_entries
-      SET month_id = v_target_month_id
-      WHERE month_id IS NULL;
-    END IF;
-
+      SET month_id = v_new_month_id
+      WHERE month_id IS NULL
+        AND bazar_date >= r.m_start
+        AND bazar_date <= r.m_end;
+    END LOOP;
   END IF;
 
-  -- Step D: Safely enforce NOT NULL on month_id only if 0 NULL rows remain
-  IF NOT EXISTS (SELECT 1 FROM bazar_entries WHERE month_id IS NULL) THEN
-    IF EXISTS (
-      SELECT 1 FROM information_schema.columns
-      WHERE table_schema = 'public'
-        AND table_name = 'bazar_entries'
-        AND column_name = 'month_id'
-        AND is_nullable = 'YES'
-    ) THEN
-      ALTER TABLE bazar_entries ALTER COLUMN month_id SET NOT NULL;
-    END IF;
+  -- Step C: If there are still no months in bazar_months (e.g. fresh database with 0 entries),
+  -- create an initial active month for the current calendar month.
+  IF NOT EXISTS (SELECT 1 FROM bazar_months LIMIT 1) THEN
+    INSERT INTO bazar_months (month_name, start_date, end_date, status)
+    VALUES (
+      trim(to_char(CURRENT_DATE, 'Month YYYY')),
+      date_trunc('month', CURRENT_DATE)::DATE,
+      (date_trunc('month', CURRENT_DATE) + INTERVAL '1 month - 1 day')::DATE,
+      'active'
+    );
+  END IF;
+
+  -- Step D: Verification check — confirm zero unassigned entries remain
+  SELECT COUNT(*) INTO v_remaining_null
+  FROM bazar_entries
+  WHERE month_id IS NULL;
+
+  IF v_remaining_null > 0 THEN
+    RAISE EXCEPTION 'Safety check failed: % entries could not be safely mapped to a monthly cycle. Migration halted to protect existing data.', v_remaining_null;
+  END IF;
+
+  -- Step E: Safely enforce NOT NULL on month_id
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'bazar_entries'
+      AND column_name = 'month_id'
+      AND is_nullable = 'YES'
+  ) THEN
+    ALTER TABLE bazar_entries ALTER COLUMN month_id SET NOT NULL;
   END IF;
 END;
 $$;
@@ -210,9 +258,9 @@ CREATE POLICY "entries own or admin insert active month" ON bazar_entries FOR IN
   );
 
 -- ---------------------------------------------------------------------------
--- 10. RPC: close_month (Consistent calculation with dashboard settlement)
---     Counts all active members (including those with 0 spending).
---     Stored totals, member count, per-person share, and snapshot agree.
+-- 10. RPC: close_month (Authoritative Database Generation)
+--     Validates against actual database entries and active profiles.
+--     Guarantees totals, member count, share, and snapshot cannot disagree.
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.close_month(
   p_month_id UUID,
@@ -228,13 +276,21 @@ DECLARE
   v_total NUMERIC(12,2);
   v_members INTEGER;
   v_share NUMERIC(12,2);
+  v_members_json JSONB;
+  v_totals_json JSONB;
+  v_entries_json JSONB;
+  v_authoritative_snapshot JSONB;
+  v_db_spent NUMERIC(12,2);
+  v_profile RECORD;
+  v_bal_json JSONB := '{}'::JSONB;
+  v_tx_json JSONB := '[]'::JSONB;
 BEGIN
-  -- Verify caller is admin
+  -- 1. Admin verification
   IF NOT public.is_admin() THEN
     RAISE EXCEPTION 'Only admin can close a month';
   END IF;
 
-  -- Lock the month record
+  -- 2. Lock the month record
   SELECT * INTO v_month FROM bazar_months WHERE id = p_month_id FOR UPDATE;
 
   IF v_month IS NULL THEN
@@ -245,44 +301,103 @@ BEGIN
     RAISE EXCEPTION 'Month is already closed';
   END IF;
 
-  -- 1. Calculate actual monthly total expenditure
+  -- 3. Calculate canonical total expenditure directly from database entries
   SELECT ROUND(COALESCE(SUM(amount), 0), 2) INTO v_total
   FROM bazar_entries WHERE month_id = p_month_id;
 
-  -- 2. Count active participating members
-  --    In shared-bazar accounting, expenses are split among all active household members,
-  --    including members with zero spending for the month.
+  -- 4. Count active participating members from profiles table
   SELECT COUNT(*) INTO v_members
   FROM profiles
   WHERE status = 'active';
 
-  -- Fallbacks if profiles table has no rows or status column not yet marked
   IF v_members IS NULL OR v_members = 0 THEN
     SELECT COUNT(*) INTO v_members FROM profiles;
   END IF;
 
-  -- If snapshot provides a validated member list, respect that count
-  IF (v_members IS NULL OR v_members = 0) AND p_settlement_snapshot IS NOT NULL THEN
-    IF p_settlement_snapshot ? 'members' AND jsonb_array_length(p_settlement_snapshot->'members') > 0 THEN
-      v_members := jsonb_array_length(p_settlement_snapshot->'members');
-    END IF;
-  END IF;
-
-  -- Ensure divisor is at least 1
   IF v_members IS NULL OR v_members = 0 THEN
     v_members := 1;
   END IF;
 
-  -- 3. Calculate equal share per active member
+  -- 5. Calculate canonical equal share per member
   v_share := ROUND(v_total / v_members, 2);
 
-  -- 4. Save permanent immutable snapshot and close month
+  -- 6. Build authoritative member list from profiles
+  SELECT COALESCE(jsonb_agg(jsonb_build_object(
+    'id', p.id,
+    'name', p.name,
+    'role', p.role
+  ) ORDER BY p.name), '[]'::jsonb)
+  INTO v_members_json
+  FROM profiles p
+  WHERE p.status = 'active';
+
+  -- 7. Build authoritative member-wise expenditure totals from actual database entries
+  SELECT COALESCE(jsonb_object_agg(
+    p.name,
+    COALESCE(spent.total_spent, 0)
+  ), '{}'::jsonb)
+  INTO v_totals_json
+  FROM profiles p
+  LEFT JOIN (
+    SELECT user_id, ROUND(COALESCE(SUM(amount), 0), 2) as total_spent
+    FROM bazar_entries
+    WHERE month_id = p_month_id
+    GROUP BY user_id
+  ) spent ON spent.user_id = p.id
+  WHERE p.status = 'active';
+
+  -- 8. Build authoritative entries list directly from database
+  SELECT COALESCE(jsonb_agg(jsonb_build_object(
+    'id', e.id,
+    'user_id', e.user_id,
+    'person', p.name,
+    'bazar_date', e.bazar_date,
+    'item', e.item,
+    'category', e.category,
+    'amount', e.amount,
+    'notes', e.notes
+  ) ORDER BY e.bazar_date DESC, e.created_at DESC), '[]'::jsonb)
+  INTO v_entries_json
+  FROM bazar_entries e
+  JOIN profiles p ON p.id = e.user_id
+  WHERE e.month_id = p_month_id;
+
+  -- 9. Calculate individual balances from actual database totals
+  FOR v_profile IN (SELECT name FROM profiles WHERE status = 'active' ORDER BY name) LOOP
+    v_db_spent := COALESCE((v_totals_json->>v_profile.name)::NUMERIC, 0);
+    v_bal_json := v_bal_json || jsonb_build_object(
+      v_profile.name,
+      ROUND(v_db_spent - v_share, 2)
+    );
+  END LOOP;
+
+  -- 10. Extract transactions from submitted snapshot if provided
+  IF p_settlement_snapshot IS NOT NULL AND (p_settlement_snapshot->'settlement' ? 'transactions') THEN
+    v_tx_json := p_settlement_snapshot->'settlement'->'transactions';
+  END IF;
+
+  -- 11. Assemble authoritative snapshot
+  v_authoritative_snapshot := jsonb_build_object(
+    'totals', v_totals_json,
+    'members', v_members_json,
+    'entries', v_entries_json,
+    'settlement', jsonb_build_object(
+      'total', v_total,
+      'share', v_share,
+      'balances', v_bal_json,
+      'transactions', v_tx_json
+    ),
+    'closed_at', NOW(),
+    'closed_by', auth.uid()
+  );
+
+  -- 12. Save verified values and authoritative snapshot
   UPDATE bazar_months SET
     status = 'closed',
     total_amount = v_total,
     total_members = v_members,
     per_person_share = v_share,
-    settlement_snapshot = p_settlement_snapshot,
+    settlement_snapshot = v_authoritative_snapshot,
     closed_by = auth.uid(),
     closed_at = NOW()
   WHERE id = p_month_id;
@@ -291,13 +406,19 @@ BEGIN
     'success', true,
     'total', v_total,
     'members', v_members,
-    'share', v_share
+    'share', v_share,
+    'snapshot', v_authoritative_snapshot
   );
 END;
 $$;
 
 -- ---------------------------------------------------------------------------
 -- 11. RPC: start_new_month
+--     Enforces:
+--       - Admin caller
+--       - start_date <= end_date
+--       - No overlapping month date ranges
+--       - Single active month constraint
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.start_new_month(
   p_month_name TEXT,
@@ -311,20 +432,35 @@ SET search_path = public
 AS $$
 DECLARE
   v_active_count INTEGER;
+  v_overlap_count INTEGER;
   v_new_id UUID;
 BEGIN
-  -- Verify caller is admin
+  -- 1. Admin verification
   IF NOT public.is_admin() THEN
     RAISE EXCEPTION 'Only admin can start a new month';
   END IF;
 
-  -- Check no active month exists
-  SELECT COUNT(*) INTO v_active_count FROM bazar_months WHERE status = 'active';
-  IF v_active_count > 0 THEN
-    RAISE EXCEPTION 'An active month already exists. Close it first.';
+  -- 2. Validate start_date <= end_date
+  IF p_start_date > p_end_date THEN
+    RAISE EXCEPTION 'start_date (%) must be before or equal to end_date (%)', p_start_date, p_end_date;
   END IF;
 
-  -- Create new month
+  -- 3. Check no active month exists
+  SELECT COUNT(*) INTO v_active_count FROM bazar_months WHERE status = 'active';
+  IF v_active_count > 0 THEN
+    RAISE EXCEPTION 'An active month already exists. Close it first before starting a new month.';
+  END IF;
+
+  -- 4. Prevent overlapping month date ranges
+  SELECT COUNT(*) INTO v_overlap_count
+  FROM bazar_months
+  WHERE NOT (end_date < p_start_date OR start_date > p_end_date);
+
+  IF v_overlap_count > 0 THEN
+    RAISE EXCEPTION 'Date range [% to %] overlaps with an existing monthly period', p_start_date, p_end_date;
+  END IF;
+
+  -- 5. Create new active month
   INSERT INTO bazar_months (month_name, start_date, end_date, status)
   VALUES (p_month_name, p_start_date, p_end_date, 'active')
   RETURNING id INTO v_new_id;
