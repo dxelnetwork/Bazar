@@ -2,7 +2,8 @@
 -- Complete Schema Reference: Bazar Manager
 -- Stack: Next.js, Supabase, PostgreSQL (Single Source of Truth)
 -- Hardened with profile privilege protection, closed month immutability,
--- UUID-keyed settlements, and strict RPC permissions.
+-- UUID-keyed settlements, deterministic integer-cent rounding reconciliation,
+-- and strict RPC permissions.
 -- =============================================================================
 
 create extension if not exists pgcrypto;
@@ -254,7 +255,10 @@ as $$
 declare
   v_month record;
   v_total numeric(12,2);
+  v_total_cents bigint;
   v_members integer;
+  v_base_share_cents bigint;
+  v_remainder_cents bigint;
   v_share numeric(12,2);
 
   v_members_json jsonb;
@@ -264,19 +268,25 @@ declare
   v_authoritative_snapshot jsonb;
 
   v_profile record;
+  v_idx int := 0;
   v_spent numeric(12,2);
+  v_spent_cents bigint;
+  v_allocated_share_cents bigint;
+  v_bal_cents bigint;
   v_bal numeric(12,2);
 
+  -- Transaction settlement arrays (integer cents, UUID-keyed)
   v_debtor_ids uuid[] := '{}';
   v_debtor_names text[] := '{}';
-  v_debtor_amts numeric[] := '{}';
+  v_debtor_cents bigint[] := '{}';
 
   v_creditor_ids uuid[] := '{}';
   v_creditor_names text[] := '{}';
-  v_creditor_amts numeric[] := '{}';
+  v_creditor_cents bigint[] := '{}';
 
   v_d_idx int := 1;
   v_c_idx int := 1;
+  v_tx_cents bigint;
   v_tx_amt numeric(12,2);
   v_tx_json jsonb := '[]'::jsonb;
 begin
@@ -310,7 +320,10 @@ begin
   select round(coalesce(sum(amount), 0), 2) into v_total
   from bazar_entries where month_id = p_month_id;
 
-  -- 5. Calculate canonical equal share per active member
+  -- 5. Calculate canonical equal share and integer cent distribution
+  v_total_cents := round(v_total * 100)::bigint;
+  v_base_share_cents := v_total_cents / v_members;
+  v_remainder_cents := v_total_cents % v_members;
   v_share := round(v_total / v_members, 2);
 
   -- 6. Build authoritative member list
@@ -323,7 +336,8 @@ begin
   from profiles p
   where p.status = 'active';
 
-  -- 7. Calculate member expenditures and balances using user UUID as keys
+  -- 7. Calculate member expenditures and balances using integer cents with deterministic cent allocation
+  v_idx := 0;
   for v_profile in (
     select
       p.id,
@@ -337,33 +351,45 @@ begin
       group by user_id
     ) spent on spent.user_id = p.id
     where p.status = 'active'
-    order by p.name asc
+    order by p.id asc
   ) loop
+    v_idx := v_idx + 1;
     v_spent := v_profile.total_spent;
-    v_bal := round(v_spent - v_share, 2);
+    v_spent_cents := round(v_spent * 100)::bigint;
+
+    -- Deterministically allocate remainder cents to the first v_remainder_cents members ordered by stable UUID
+    if v_idx <= v_remainder_cents then
+      v_allocated_share_cents := v_base_share_cents + 1;
+    else
+      v_allocated_share_cents := v_base_share_cents;
+    end if;
+
+    v_bal_cents := v_spent_cents - v_allocated_share_cents;
+    v_bal := round(v_bal_cents / 100.0, 2);
 
     -- Store using UUID keys to safely handle duplicate member names
     v_totals_by_id := v_totals_by_id || jsonb_build_object(v_profile.id::text, v_spent);
     v_balances_by_id := v_balances_by_id || jsonb_build_object(v_profile.id::text, v_bal);
 
-    if v_bal < -0.001 then
+    if v_bal_cents < 0 then
       v_debtor_ids := array_append(v_debtor_ids, v_profile.id);
       v_debtor_names := array_append(v_debtor_names, v_profile.name);
-      v_debtor_amts := array_append(v_debtor_amts, -v_bal);
-    elsif v_bal > 0.001 then
+      v_debtor_cents := array_append(v_debtor_cents, -v_bal_cents);
+    elsif v_bal_cents > 0 then
       v_creditor_ids := array_append(v_creditor_ids, v_profile.id);
       v_creditor_names := array_append(v_creditor_names, v_profile.name);
-      v_creditor_amts := array_append(v_creditor_amts, v_bal);
+      v_creditor_cents := array_append(v_creditor_cents, v_bal_cents);
     end if;
   end loop;
 
-  -- 8. Calculate settlement transactions server-side (who pays whom and how much)
+  -- 8. Calculate settlement transactions server-side using integer cents
   v_d_idx := 1;
   v_c_idx := 1;
   while v_d_idx <= coalesce(array_length(v_debtor_ids, 1), 0)
     and v_c_idx <= coalesce(array_length(v_creditor_ids, 1), 0) loop
-    v_tx_amt := round(least(v_debtor_amts[v_d_idx], v_creditor_amts[v_c_idx]), 2);
-    if v_tx_amt > 0 then
+    v_tx_cents := least(v_debtor_cents[v_d_idx], v_creditor_cents[v_c_idx]);
+    if v_tx_cents > 0 then
+      v_tx_amt := round(v_tx_cents / 100.0, 2);
       v_tx_json := v_tx_json || jsonb_build_array(jsonb_build_object(
         'fromId', v_debtor_ids[v_d_idx],
         'fromName', v_debtor_names[v_d_idx],
@@ -373,13 +399,13 @@ begin
         'to', v_creditor_names[v_c_idx],
         'amount', v_tx_amt
       ));
-      v_debtor_amts[v_d_idx] := round(v_debtor_amts[v_d_idx] - v_tx_amt, 2);
-      v_creditor_amts[v_c_idx] := round(v_creditor_amts[v_c_idx] - v_tx_amt, 2);
+      v_debtor_cents[v_d_idx] := v_debtor_cents[v_d_idx] - v_tx_cents;
+      v_creditor_cents[v_c_idx] := v_creditor_cents[v_c_idx] - v_tx_cents;
     end if;
-    if v_debtor_amts[v_d_idx] <= 0.001 then
+    if v_debtor_cents[v_d_idx] = 0 then
       v_d_idx := v_d_idx + 1;
     end if;
-    if v_creditor_amts[v_c_idx] <= 0.001 then
+    if v_creditor_cents[v_c_idx] = 0 then
       v_c_idx := v_c_idx + 1;
     end if;
   end loop;

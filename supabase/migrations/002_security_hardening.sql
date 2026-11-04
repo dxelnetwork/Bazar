@@ -1,7 +1,8 @@
 -- =============================================================================
 -- Migration: 002_security_hardening.sql
 -- Purpose:   Security hardening, profile privilege escalation prevention,
---            closed month immutability, UUID-based settlements, and
+--            closed month immutability, UUID-based settlements,
+--            deterministic integer-cent rounding reconciliation, and
 --            strict RPC execution grants.
 --
 -- TARGET:    Run this migration on databases that already have
@@ -140,12 +141,14 @@ CREATE POLICY "months admin update" ON bazar_months FOR UPDATE
   WITH CHECK (public.is_admin() AND status = 'active');
 
 -- ---------------------------------------------------------------------------
--- 4. Server-Side Month Closure: UUID-Keyed Settlement Data Integrity
+-- 4. Server-Side Month Closure: Deterministic Cent-Based Settlement
 --    - Computes totals, equal share, balances, and transactions 100% server-side
+--    - Reconciles cent rounding deterministically so SUM(balances) = 0.00 exactly
+--    - Total creditor balances equal total debtor balances to the cent
+--    - All settlement transactions clear debtor and creditor balances completely
 --    - Ignores client-supplied settlement calculations
 --    - Rejects month closure if there are no active participating members
 --    - Uses Supabase user UUIDs as primary keys to handle duplicate member names safely
---    - Generates settlement transactions using IDs and display names
 --    - Saves authoritative snapshot atomically
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.close_month(
@@ -160,7 +163,10 @@ AS $$
 DECLARE
   v_month RECORD;
   v_total NUMERIC(12,2);
+  v_total_cents BIGINT;
   v_members INTEGER;
+  v_base_share_cents BIGINT;
+  v_remainder_cents BIGINT;
   v_share NUMERIC(12,2);
 
   v_members_json JSONB;
@@ -170,20 +176,25 @@ DECLARE
   v_authoritative_snapshot JSONB;
 
   v_profile RECORD;
+  v_idx INT := 0;
   v_spent NUMERIC(12,2);
+  v_spent_cents BIGINT;
+  v_allocated_share_cents BIGINT;
+  v_bal_cents BIGINT;
   v_bal NUMERIC(12,2);
 
-  -- Transaction settlement arrays (UUID-keyed)
+  -- Transaction settlement arrays (integer cents, UUID-keyed)
   v_debtor_ids UUID[] := '{}';
   v_debtor_names TEXT[] := '{}';
-  v_debtor_amts NUMERIC[] := '{}';
+  v_debtor_cents BIGINT[] := '{}';
 
   v_creditor_ids UUID[] := '{}';
   v_creditor_names TEXT[] := '{}';
-  v_creditor_amts NUMERIC[] := '{}';
+  v_creditor_cents BIGINT[] := '{}';
 
   v_d_idx INT := 1;
   v_c_idx INT := 1;
+  v_tx_cents BIGINT;
   v_tx_amt NUMERIC(12,2);
   v_tx_json JSONB := '[]'::JSONB;
 BEGIN
@@ -217,7 +228,10 @@ BEGIN
   SELECT ROUND(COALESCE(SUM(amount), 0), 2) INTO v_total
   FROM bazar_entries WHERE month_id = p_month_id;
 
-  -- 5. Calculate canonical equal share per active member
+  -- 5. Calculate canonical equal share and integer cent distribution
+  v_total_cents := ROUND(v_total * 100)::BIGINT;
+  v_base_share_cents := v_total_cents / v_members;
+  v_remainder_cents := v_total_cents % v_members;
   v_share := ROUND(v_total / v_members, 2);
 
   -- 6. Build authoritative member list
@@ -230,7 +244,8 @@ BEGIN
   FROM profiles p
   WHERE p.status = 'active';
 
-  -- 7. Calculate member expenditures and balances using user UUID as keys
+  -- 7. Calculate member expenditures and balances using integer cents with deterministic cent allocation
+  v_idx := 0;
   FOR v_profile IN (
     SELECT
       p.id,
@@ -244,33 +259,45 @@ BEGIN
       GROUP BY user_id
     ) spent ON spent.user_id = p.id
     WHERE p.status = 'active'
-    ORDER BY p.name ASC
+    ORDER BY p.id ASC
   ) LOOP
+    v_idx := v_idx + 1;
     v_spent := v_profile.total_spent;
-    v_bal := ROUND(v_spent - v_share, 2);
+    v_spent_cents := ROUND(v_spent * 100)::BIGINT;
+
+    -- Deterministically allocate remainder cents to the first v_remainder_cents members ordered by stable UUID
+    IF v_idx <= v_remainder_cents THEN
+      v_allocated_share_cents := v_base_share_cents + 1;
+    ELSE
+      v_allocated_share_cents := v_base_share_cents;
+    END IF;
+
+    v_bal_cents := v_spent_cents - v_allocated_share_cents;
+    v_bal := ROUND(v_bal_cents / 100.0, 2);
 
     -- Store using UUID keys to handle duplicate member names safely
     v_totals_by_id := v_totals_by_id || jsonb_build_object(v_profile.id::TEXT, v_spent);
     v_balances_by_id := v_balances_by_id || jsonb_build_object(v_profile.id::TEXT, v_bal);
 
-    IF v_bal < -0.001 THEN
+    IF v_bal_cents < 0 THEN
       v_debtor_ids := array_append(v_debtor_ids, v_profile.id);
       v_debtor_names := array_append(v_debtor_names, v_profile.name);
-      v_debtor_amts := array_append(v_debtor_amts, -v_bal);
-    ELSIF v_bal > 0.001 THEN
+      v_debtor_cents := array_append(v_debtor_cents, -v_bal_cents);
+    ELSIF v_bal_cents > 0 THEN
       v_creditor_ids := array_append(v_creditor_ids, v_profile.id);
       v_creditor_names := array_append(v_creditor_names, v_profile.name);
-      v_creditor_amts := array_append(v_creditor_amts, v_bal);
+      v_creditor_cents := array_append(v_creditor_cents, v_bal_cents);
     END IF;
   END LOOP;
 
-  -- 8. Calculate settlement transactions server-side (who pays whom and how much)
+  -- 8. Calculate settlement transactions server-side using integer cents
   v_d_idx := 1;
   v_c_idx := 1;
   WHILE v_d_idx <= COALESCE(array_length(v_debtor_ids, 1), 0)
     AND v_c_idx <= COALESCE(array_length(v_creditor_ids, 1), 0) LOOP
-    v_tx_amt := ROUND(LEAST(v_debtor_amts[v_d_idx], v_creditor_amts[v_c_idx]), 2);
-    IF v_tx_amt > 0 THEN
+    v_tx_cents := LEAST(v_debtor_cents[v_d_idx], v_creditor_cents[v_c_idx]);
+    IF v_tx_cents > 0 THEN
+      v_tx_amt := ROUND(v_tx_cents / 100.0, 2);
       v_tx_json := v_tx_json || jsonb_build_array(jsonb_build_object(
         'fromId', v_debtor_ids[v_d_idx],
         'fromName', v_debtor_names[v_d_idx],
@@ -280,13 +307,13 @@ BEGIN
         'to', v_creditor_names[v_c_idx],
         'amount', v_tx_amt
       ));
-      v_debtor_amts[v_d_idx] := ROUND(v_debtor_amts[v_d_idx] - v_tx_amt, 2);
-      v_creditor_amts[v_c_idx] := ROUND(v_creditor_amts[v_c_idx] - v_tx_amt, 2);
+      v_debtor_cents[v_d_idx] := v_debtor_cents[v_d_idx] - v_tx_cents;
+      v_creditor_cents[v_c_idx] := v_creditor_cents[v_c_idx] - v_tx_cents;
     END IF;
-    IF v_debtor_amts[v_d_idx] <= 0.001 THEN
+    IF v_debtor_cents[v_d_idx] = 0 THEN
       v_d_idx := v_d_idx + 1;
     END IF;
-    IF v_creditor_amts[v_c_idx] <= 0.001 THEN
+    IF v_creditor_cents[v_c_idx] = 0 THEN
       v_c_idx := v_c_idx + 1;
     END IF;
   END LOOP;
@@ -361,4 +388,3 @@ GRANT EXECUTE ON FUNCTION public.close_month(UUID, JSONB) TO authenticated;
 
 REVOKE ALL ON FUNCTION public.start_new_month(TEXT, DATE, DATE) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION public.start_new_month(TEXT, DATE, DATE) TO authenticated;
-
