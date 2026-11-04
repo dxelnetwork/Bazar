@@ -105,13 +105,8 @@ export default function Home() {
       if (error) setMessage(error.message);
       else setRows(es || []);
     } else {
-      // No active month — load all entries (fallback)
-      const { data: es } = await supabase
-        .from('bazar_entries')
-        .select('*')
-        .order('bazar_date', { ascending: false })
-        .order('created_at', { ascending: false });
-      setRows(es || []);
+      // No active month — show empty dashboard (historical entries remain accessible in History tab)
+      setRows([]);
     }
   }, []);
 
@@ -272,40 +267,12 @@ export default function Home() {
     setBusy(true);
     setMessage('');
 
-    // Build settlement snapshot
-    const nameById = Object.fromEntries(profiles.map((p) => [p.id, p.name]));
-    const totals = {};
-    const activeProfiles = profiles.filter((p) => p.status !== 'inactive');
-    activeProfiles.forEach((p) => { totals[p.name] = 0; });
-    rows.forEach((r) => {
-      const n = nameById[r.user_id] || 'Unknown';
-      totals[n] = (totals[n] || 0) + Number(r.amount);
-    });
-    const s = settlement(totals);
-    const snapshot = {
-      totals,
-      settlement: s,
-      members: activeProfiles.map((p) => ({ id: p.id, name: p.name, role: p.role })),
-      entries: rows.map((r) => ({
-        id: r.id,
-        user_id: r.user_id,
-        person: nameById[r.user_id],
-        bazar_date: r.bazar_date,
-        item: r.item,
-        category: r.category,
-        amount: Number(r.amount),
-        notes: r.notes,
-      })),
-      closed_at: new Date().toISOString(),
-      closed_by_name: profile?.name,
-    };
-
     try {
       const hdrs = await authHeaders();
       const res = await fetch('/api/admin/months/close', {
         method: 'POST',
         headers: hdrs,
-        body: JSON.stringify({ monthId: activeMonth.id, settlementSnapshot: snapshot }),
+        body: JSON.stringify({ monthId: activeMonth.id }),
       });
       const data = await res.json();
       if (!res.ok) {
@@ -378,22 +345,23 @@ export default function Home() {
     [profiles]
   );
 
+  const people = useMemo(
+    () => (profiles.length ? profiles.filter((p) => p.status !== 'inactive') : []),
+    [profiles]
+  );
+
   const totals = useMemo(() => {
     const t = {};
-    profiles.filter((p) => p.status !== 'inactive').forEach((p) => { t[p.name] = 0; });
+    people.forEach((p) => { t[p.id] = 0; });
     rows.forEach((r) => {
-      const n = nameById[r.user_id] || 'Unknown';
-      t[n] = (t[n] || 0) + Number(r.amount);
+      if (r.user_id) {
+        t[r.user_id] = (t[r.user_id] || 0) + Number(r.amount);
+      }
     });
     return t;
-  }, [rows, nameById, profiles]);
+  }, [rows, people]);
 
-  const s = useMemo(() => settlement(totals), [totals]);
-
-  const people = useMemo(
-    () => (profiles.length ? profiles.filter((p) => p.status !== 'inactive') : Object.keys(totals).map((name) => ({ id: name, name, role: 'member' }))),
-    [profiles, totals]
-  );
+  const s = useMemo(() => settlement(totals, people), [totals, people]);
 
   /* ── loading / auth screens ────────────────────────── */
 
@@ -522,11 +490,11 @@ export default function Home() {
               <article className="card" key={p.id}>
                 <h2>{p.name}</h2>
                 <p>
-                  Paid <b>{fmt(totals[p.name] || 0)}</b>
+                  Paid <b>{fmt(totals[p.id] || 0)}</b>
                 </p>
-                <p className={(s.balances[p.name] || 0) >= 0 ? 'receive' : 'pay'}>
-                  {(s.balances[p.name] || 0) >= 0 ? '↑ Receive' : '↓ Pay'}{' '}
-                  <b>{fmt(Math.abs(s.balances[p.name] || 0))}</b>
+                <p className={(s.balances[p.id] || 0) >= 0 ? 'receive' : 'pay'}>
+                  {(s.balances[p.id] || 0) >= 0 ? '↑ Receive' : '↓ Pay'}{' '}
+                  <b>{fmt(Math.abs(s.balances[p.id] || 0))}</b>
                 </p>
               </article>
             ))}
@@ -566,9 +534,9 @@ export default function Home() {
             {s.transactions.length ? (
               s.transactions.map((t, i) => (
                 <div className="tx" key={i}>
-                  <span>↓ {t.from}</span>
+                  <span>↓ {t.fromName || t.from}</span>
                   <b>{fmt(t.amount)}</b>
-                  <span>↑ {t.to}</span>
+                  <span>↑ {t.toName || t.to}</span>
                 </div>
               ))
             ) : (
@@ -844,8 +812,9 @@ function HistoryList({ allMonths, onSelect }) {
 
 function HistoryDetail({ month, onBack }) {
   const snap = month.settlement_snapshot || {};
-  const snapTotals = snap.totals || {};
+  const snapTotals = snap.totals_by_id || snap.totals || {};
   const snapSettlement = snap.settlement || { total: 0, share: 0, balances: {}, transactions: [] };
+  const snapBalances = snapSettlement.balances_by_id || snapSettlement.balances || snap.balances_by_id || {};
   const snapMembers = snap.members || [];
   const snapEntries = snap.entries || [];
 
@@ -872,28 +841,32 @@ function HistoryDetail({ month, onBack }) {
       <section className="hero" style={{ marginTop: 14 }}>
         <div>
           <span>Monthly Total</span>
-          <strong>{fmt(snapSettlement.total)}</strong>
+          <strong>{fmt(snapSettlement.total ?? month.total_amount)}</strong>
         </div>
         <div>
           <span>Per Person ({month.total_members} members)</span>
-          <strong>{fmt(snapSettlement.share)}</strong>
+          <strong>{fmt(snapSettlement.share ?? month.per_person_share)}</strong>
         </div>
       </section>
 
       {/* Member breakdown */}
       <section className="grid" style={{ marginTop: 14 }}>
-        {snapMembers.map((m) => (
-          <article className="card" key={m.id}>
-            <h2>{m.name}</h2>
-            <p>
-              Paid <b>{fmt(snapTotals[m.name] || 0)}</b>
-            </p>
-            <p className={(snapSettlement.balances[m.name] || 0) >= 0 ? 'receive' : 'pay'}>
-              {(snapSettlement.balances[m.name] || 0) >= 0 ? '↑ Receive' : '↓ Pay'}{' '}
-              <b>{fmt(Math.abs(snapSettlement.balances[m.name] || 0))}</b>
-            </p>
-          </article>
-        ))}
+        {snapMembers.map((m) => {
+          const paid = snapTotals[m.id] !== undefined ? snapTotals[m.id] : (snapTotals[m.name] || 0);
+          const bal = snapBalances[m.id] !== undefined ? snapBalances[m.id] : (snapBalances[m.name] || 0);
+          return (
+            <article className="card" key={m.id || m.name}>
+              <h2>{m.name}</h2>
+              <p>
+                Paid <b>{fmt(paid)}</b>
+              </p>
+              <p className={bal >= 0 ? 'receive' : 'pay'}>
+                {bal >= 0 ? '↑ Receive' : '↓ Pay'}{' '}
+                <b>{fmt(Math.abs(bal))}</b>
+              </p>
+            </article>
+          );
+        })}
       </section>
 
       {/* Who pays whom */}
@@ -902,9 +875,9 @@ function HistoryDetail({ month, onBack }) {
         {snapSettlement.transactions?.length ? (
           snapSettlement.transactions.map((t, i) => (
             <div className="tx" key={i}>
-              <span>↓ {t.from}</span>
+              <span>↓ {t.fromName || t.from}</span>
               <b>{fmt(t.amount)}</b>
-              <span>↑ {t.to}</span>
+              <span>↑ {t.toName || t.to}</span>
             </div>
           ))
         ) : (

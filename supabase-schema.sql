@@ -1,11 +1,15 @@
 -- =============================================================================
 -- Complete Schema Reference: Bazar Manager
 -- Stack: Next.js, Supabase, PostgreSQL (Single Source of Truth)
+-- Hardened with profile privilege protection, closed month immutability,
+-- UUID-keyed settlements, and strict RPC permissions.
 -- =============================================================================
 
 create extension if not exists pgcrypto;
 
+-- -----------------------------------------------------------------------------
 -- 1. Profiles Table
+-- -----------------------------------------------------------------------------
 create table if not exists profiles (
   id uuid primary key references auth.users(id) on delete cascade,
   name text not null,
@@ -15,7 +19,9 @@ create table if not exists profiles (
   created_at timestamptz default now()
 );
 
+-- -----------------------------------------------------------------------------
 -- 2. Bazar Months Table (Monthly Accounting Cycles)
+-- -----------------------------------------------------------------------------
 create table if not exists bazar_months (
   id uuid primary key default gen_random_uuid(),
   month_name text not null,
@@ -31,7 +37,9 @@ create table if not exists bazar_months (
   created_at timestamptz default now()
 );
 
+-- -----------------------------------------------------------------------------
 -- 3. Bazar Entries Table
+-- -----------------------------------------------------------------------------
 create table if not exists bazar_entries (
   id uuid primary key default gen_random_uuid(),
   user_id uuid not null references profiles(id) on delete cascade,
@@ -45,7 +53,7 @@ create table if not exists bazar_entries (
   updated_at timestamptz default now()
 );
 
--- Enable RLS
+-- Enable Row Level Security
 alter table profiles enable row level security;
 alter table bazar_months enable row level security;
 alter table bazar_entries enable row level security;
@@ -57,7 +65,9 @@ on bazar_months (status) where status = 'active';
 -- Index for entry lookups by month
 create index if not exists idx_entries_month on bazar_entries(month_id);
 
+-- -----------------------------------------------------------------------------
 -- 4. Helper Security Functions
+-- -----------------------------------------------------------------------------
 create or replace function public.is_admin()
 returns boolean language sql stable security definer set search_path = public as $$
   select exists(select 1 from profiles where id = auth.uid() and role = 'admin');
@@ -73,7 +83,37 @@ returns boolean language sql stable security definer set search_path = public as
   select exists(select 1 from profiles where id = uid and status = 'active');
 $$;
 
--- 5. RLS Policies: profiles
+-- -----------------------------------------------------------------------------
+-- 5. Profile Security: Prevent Privilege Escalation
+-- -----------------------------------------------------------------------------
+create or replace function public.check_profile_update()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  -- If the caller is NOT an admin, forbid modifying role, status, or id
+  if not public.is_admin() then
+    if new.role is distinct from old.role then
+      raise exception 'Privilege escalation denied: Only admin can modify user roles';
+    end if;
+    if new.status is distinct from old.status then
+      raise exception 'Permission denied: Only admin can modify account status';
+    end if;
+    if new.id is distinct from old.id then
+      raise exception 'Permission denied: User ID cannot be altered';
+    end if;
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_check_profile_update on profiles;
+create trigger trg_check_profile_update
+before update on profiles
+for each row execute function public.check_profile_update();
+
 drop policy if exists "profiles authenticated read" on profiles;
 create policy "profiles authenticated read" on profiles for select
   using (auth.uid() is not null);
@@ -83,7 +123,28 @@ create policy "profiles self or admin update" on profiles for update
   using (id = auth.uid() or public.is_admin())
   with check (id = auth.uid() or public.is_admin());
 
--- 6. RLS Policies: bazar_months
+-- -----------------------------------------------------------------------------
+-- 6. Closed Month Immutability: bazar_months
+-- -----------------------------------------------------------------------------
+create or replace function public.check_closed_month_immutable()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if old.status = 'closed' then
+    raise exception 'Closed month immutability: Closed month records and settlement snapshots are permanent and cannot be modified';
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_check_closed_month_immutable on bazar_months;
+create trigger trg_check_closed_month_immutable
+before update or delete on bazar_months
+for each row execute function public.check_closed_month_immutable();
+
 drop policy if exists "months authenticated read" on bazar_months;
 create policy "months authenticated read" on bazar_months for select
   using (auth.uid() is not null);
@@ -97,7 +158,39 @@ create policy "months admin update" on bazar_months for update
   using (public.is_admin() and status = 'active')
   with check (public.is_admin());
 
--- 7. RLS Policies: bazar_entries
+-- -----------------------------------------------------------------------------
+-- 7. Closed Month Immutability: bazar_entries
+-- -----------------------------------------------------------------------------
+create or replace function public.check_entry_month_active()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if tg_op = 'DELETE' then
+    if not public.is_month_active(old.month_id) then
+      raise exception 'Closed month immutability: Cannot delete entries from a closed month';
+    end if;
+    return old;
+  elsif tg_op = 'UPDATE' then
+    if not public.is_month_active(old.month_id) then
+      raise exception 'Closed month immutability: Cannot modify entries belonging to a closed month';
+    end if;
+    if not public.is_month_active(new.month_id) then
+      raise exception 'Closed month immutability: Cannot move entries into a closed month';
+    end if;
+    return new;
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_check_entry_month_active on bazar_entries;
+create trigger trg_check_entry_month_active
+before update or delete on bazar_entries
+for each row execute function public.check_entry_month_active();
+
 drop policy if exists "entries authenticated read" on bazar_entries;
 create policy "entries authenticated read" on bazar_entries for select
   using (auth.uid() is not null);
@@ -113,15 +206,17 @@ create policy "entries own or admin insert active month" on bazar_entries for in
   );
 
 drop policy if exists "entries admin update" on bazar_entries;
-create policy "entries admin update" on bazar_entries for update
-  using (public.is_admin())
-  with check (public.is_admin());
+drop policy if exists "entries admin update active month only" on bazar_entries;
+create policy "entries admin update active month only" on bazar_entries for update
+  using (public.is_admin() and public.is_month_active(month_id))
+  with check (public.is_admin() and public.is_month_active(month_id));
 
 drop policy if exists "entries admin delete" on bazar_entries;
-create policy "entries admin delete" on bazar_entries for delete
-  using (public.is_admin());
+drop policy if exists "entries admin delete active month only" on bazar_entries;
+create policy "entries admin delete active month only" on bazar_entries for delete
+  using (public.is_admin() and public.is_month_active(month_id));
 
--- 8. Trigger: set updated_at
+-- Trigger: set updated_at
 create or replace function public.set_updated_at()
 returns trigger language plpgsql as $$
 begin
@@ -135,7 +230,9 @@ create trigger bazar_entries_updated_at
 before update on bazar_entries
 for each row execute function public.set_updated_at();
 
--- 9. RPC Functions for Month Management
+-- -----------------------------------------------------------------------------
+-- 8. RPC: close_month (Authoritative Server-Side Settlement)
+-- -----------------------------------------------------------------------------
 create or replace function public.close_month(
   p_month_id uuid,
   p_settlement_snapshot jsonb default null
@@ -150,27 +247,36 @@ declare
   v_total numeric(12,2);
   v_members integer;
   v_share numeric(12,2);
+
   v_members_json jsonb;
-  v_totals_json jsonb;
+  v_totals_by_id jsonb := '{}'::jsonb;
+  v_balances_by_id jsonb := '{}'::jsonb;
   v_entries_json jsonb;
   v_authoritative_snapshot jsonb;
-  v_db_spent numeric(12,2);
-  v_profile record;
-  v_bal_json jsonb := '{}'::jsonb;
-  v_tx_json jsonb := '[]'::jsonb;
 
+  v_profile record;
+  v_spent numeric(12,2);
+  v_bal numeric(12,2);
+
+  v_debtor_ids uuid[] := '{}';
   v_debtor_names text[] := '{}';
   v_debtor_amts numeric[] := '{}';
+
+  v_creditor_ids uuid[] := '{}';
   v_creditor_names text[] := '{}';
   v_creditor_amts numeric[] := '{}';
+
   v_d_idx int := 1;
   v_c_idx int := 1;
   v_tx_amt numeric(12,2);
+  v_tx_json jsonb := '[]'::jsonb;
 begin
+  -- 1. Admin verification
   if not public.is_admin() then
     raise exception 'Only admin can close a month';
   end if;
 
+  -- 2. Lock and validate month
   select * into v_month from bazar_months where id = p_month_id for update;
 
   if v_month is null then
@@ -181,27 +287,24 @@ begin
     raise exception 'Month is already closed';
   end if;
 
-  -- 1. Canonical total expenditure
-  select round(coalesce(sum(amount), 0), 2) into v_total
-  from bazar_entries where month_id = p_month_id;
-
-  -- 2. Count active participating members
+  -- 3. Count active participating members
   select count(*) into v_members
   from profiles
   where status = 'active';
 
+  -- Reject month closure if no active members exist
   if v_members is null or v_members = 0 then
-    select count(*) into v_members from profiles;
+    raise exception 'Cannot close month: No active members found. At least one active member is required for settlement.';
   end if;
 
-  if v_members is null or v_members = 0 then
-    v_members := 1;
-  end if;
+  -- 4. Calculate canonical total expenditure directly from actual database entries
+  select round(coalesce(sum(amount), 0), 2) into v_total
+  from bazar_entries where month_id = p_month_id;
 
-  -- 3. Canonical equal share
+  -- 5. Calculate canonical equal share per active member
   v_share := round(v_total / v_members, 2);
 
-  -- 4. Authoritative members
+  -- 6. Build authoritative member list
   select coalesce(jsonb_agg(jsonb_build_object(
     'id', p.id,
     'name', p.name,
@@ -211,22 +314,68 @@ begin
   from profiles p
   where p.status = 'active';
 
-  -- 5. Authoritative member totals
-  select coalesce(jsonb_object_agg(
-    p.name,
-    coalesce(spent.total_spent, 0)
-  ), '{}'::jsonb)
-  into v_totals_json
-  from profiles p
-  left join (
-    select user_id, round(coalesce(sum(amount), 0), 2) as total_spent
-    from bazar_entries
-    where month_id = p_month_id
-    group by user_id
-  ) spent on spent.user_id = p.id
-  where p.status = 'active';
+  -- 7. Calculate member expenditures and balances using user UUID as keys
+  for v_profile in (
+    select
+      p.id,
+      p.name,
+      round(coalesce(spent.total_spent, 0), 2) as total_spent
+    from profiles p
+    left join (
+      select user_id, round(coalesce(sum(amount), 0), 2) as total_spent
+      from bazar_entries
+      where month_id = p_month_id
+      group by user_id
+    ) spent on spent.user_id = p.id
+    where p.status = 'active'
+    order by p.name asc
+  ) loop
+    v_spent := v_profile.total_spent;
+    v_bal := round(v_spent - v_share, 2);
 
-  -- 6. Authoritative entries
+    -- Store using UUID keys to safely handle duplicate member names
+    v_totals_by_id := v_totals_by_id || jsonb_build_object(v_profile.id::text, v_spent);
+    v_balances_by_id := v_balances_by_id || jsonb_build_object(v_profile.id::text, v_bal);
+
+    if v_bal < -0.001 then
+      v_debtor_ids := array_append(v_debtor_ids, v_profile.id);
+      v_debtor_names := array_append(v_debtor_names, v_profile.name);
+      v_debtor_amts := array_append(v_debtor_amts, -v_bal);
+    elsif v_bal > 0.001 then
+      v_creditor_ids := array_append(v_creditor_ids, v_profile.id);
+      v_creditor_names := array_append(v_creditor_names, v_profile.name);
+      v_creditor_amts := array_append(v_creditor_amts, v_bal);
+    end if;
+  end loop;
+
+  -- 8. Calculate settlement transactions server-side (who pays whom and how much)
+  v_d_idx := 1;
+  v_c_idx := 1;
+  while v_d_idx <= coalesce(array_length(v_debtor_ids, 1), 0)
+    and v_c_idx <= coalesce(array_length(v_creditor_ids, 1), 0) loop
+    v_tx_amt := round(least(v_debtor_amts[v_d_idx], v_creditor_amts[v_c_idx]), 2);
+    if v_tx_amt > 0 then
+      v_tx_json := v_tx_json || jsonb_build_array(jsonb_build_object(
+        'fromId', v_debtor_ids[v_d_idx],
+        'fromName', v_debtor_names[v_d_idx],
+        'from', v_debtor_names[v_d_idx],
+        'toId', v_creditor_ids[v_c_idx],
+        'toName', v_creditor_names[v_c_idx],
+        'to', v_creditor_names[v_c_idx],
+        'amount', v_tx_amt
+      ));
+      v_debtor_amts[v_d_idx] := round(v_debtor_amts[v_d_idx] - v_tx_amt, 2);
+      v_creditor_amts[v_c_idx] := round(v_creditor_amts[v_c_idx] - v_tx_amt, 2);
+    end if;
+    if v_debtor_amts[v_d_idx] <= 0.001 then
+      v_d_idx := v_d_idx + 1;
+    end if;
+    if v_creditor_amts[v_c_idx] <= 0.001 then
+      v_c_idx := v_c_idx + 1;
+    end if;
+  end loop;
+
+  -- 9. Build authoritative entries list directly from database
   select coalesce(jsonb_agg(jsonb_build_object(
     'id', e.id,
     'user_id', e.user_id,
@@ -242,75 +391,23 @@ begin
   join profiles p on p.id = e.user_id
   where e.month_id = p_month_id;
 
-  -- 7. Authoritative balances
-  for v_profile in (select name from profiles where status = 'active' order by name) loop
-    v_db_spent := coalesce((v_totals_json->>v_profile.name)::numeric, 0);
-    v_bal_json := v_bal_json || jsonb_build_object(
-      v_profile.name,
-      round(v_db_spent - v_share, 2)
-    );
-  end loop;
-
-  -- 8. Authoritative settlement transactions calculated server-side
-  for v_profile in (
-    select p.name, round(coalesce(spent.total_spent, 0) - v_share, 2) as bal
-    from profiles p
-    left join (
-      select user_id, round(coalesce(sum(amount), 0), 2) as total_spent
-      from bazar_entries
-      where month_id = p_month_id
-      group by user_id
-    ) spent on spent.user_id = p.id
-    where p.status = 'active'
-    order by bal asc
-  ) loop
-    if v_profile.bal < -0.001 then
-      v_debtor_names := array_append(v_debtor_names, v_profile.name);
-      v_debtor_amts := array_append(v_debtor_amts, -v_profile.bal);
-    elsif v_profile.bal > 0.001 then
-      v_creditor_names := array_append(v_creditor_names, v_profile.name);
-      v_creditor_amts := array_append(v_creditor_amts, v_profile.bal);
-    end if;
-  end loop;
-
-  v_d_idx := 1;
-  v_c_idx := 1;
-  while v_d_idx <= coalesce(array_length(v_debtor_names, 1), 0)
-    and v_c_idx <= coalesce(array_length(v_creditor_names, 1), 0) loop
-    v_tx_amt := round(least(v_debtor_amts[v_d_idx], v_creditor_amts[v_c_idx]), 2);
-    if v_tx_amt > 0 then
-      v_tx_json := v_tx_json || jsonb_build_array(jsonb_build_object(
-        'from', v_debtor_names[v_d_idx],
-        'to', v_creditor_names[v_c_idx],
-        'amount', v_tx_amt
-      ));
-      v_debtor_amts[v_d_idx] := round(v_debtor_amts[v_d_idx] - v_tx_amt, 2);
-      v_creditor_amts[v_c_idx] := round(v_creditor_amts[v_c_idx] - v_tx_amt, 2);
-    end if;
-    if v_debtor_amts[v_d_idx] <= 0.001 then
-      v_d_idx := v_d_idx + 1;
-    end if;
-    if v_creditor_amts[v_c_idx] <= 0.001 then
-      v_c_idx := v_c_idx + 1;
-    end if;
-  end loop;
-
-  -- 9. Authoritative snapshot
+  -- 10. Assemble authoritative snapshot
   v_authoritative_snapshot := jsonb_build_object(
-    'totals', v_totals_json,
+    'totals_by_id', v_totals_by_id,
+    'balances_by_id', v_balances_by_id,
     'members', v_members_json,
     'entries', v_entries_json,
     'settlement', jsonb_build_object(
       'total', v_total,
       'share', v_share,
-      'balances', v_bal_json,
+      'balances_by_id', v_balances_by_id,
       'transactions', v_tx_json
     ),
     'closed_at', now(),
     'closed_by', auth.uid()
   );
 
-  -- 10. Update month record
+  -- 11. Atomically store snapshot and close month
   update bazar_months set
     status = 'closed',
     total_amount = v_total,
@@ -331,6 +428,9 @@ begin
 end;
 $$;
 
+-- -----------------------------------------------------------------------------
+-- 9. RPC: start_new_month
+-- -----------------------------------------------------------------------------
 create or replace function public.start_new_month(
   p_month_name text,
   p_start_date date,
@@ -375,25 +475,29 @@ begin
 end;
 $$;
 
+-- -----------------------------------------------------------------------------
 -- 10. Reporting View
+-- -----------------------------------------------------------------------------
 create or replace view public.bazar_entries_with_people as
 select e.id, e.month_id, e.user_id, p.name as person, e.bazar_date, e.item, e.category,
        e.amount, e.notes, e.created_at, e.updated_at
 from bazar_entries e
 join profiles p on p.id = e.user_id;
 
+-- -----------------------------------------------------------------------------
 -- 11. Security Definer RPC Execution Permissions
-revoke all on function public.is_admin() from public;
+-- -----------------------------------------------------------------------------
+revoke all on function public.is_admin() from public, anon;
 grant execute on function public.is_admin() to authenticated;
 
-revoke all on function public.is_month_active(uuid) from public;
+revoke all on function public.is_month_active(uuid) from public, anon;
 grant execute on function public.is_month_active(uuid) to authenticated;
 
-revoke all on function public.is_active_member(uuid) from public;
+revoke all on function public.is_active_member(uuid) from public, anon;
 grant execute on function public.is_active_member(uuid) to authenticated;
 
-revoke all on function public.close_month(uuid, jsonb) from public;
+revoke all on function public.close_month(uuid, jsonb) from public, anon;
 grant execute on function public.close_month(uuid, jsonb) to authenticated;
 
-revoke all on function public.start_new_month(text, date, date) from public;
+revoke all on function public.start_new_month(text, date, date) from public, anon;
 grant execute on function public.start_new_month(text, date, date) to authenticated;
