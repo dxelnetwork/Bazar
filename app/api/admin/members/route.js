@@ -142,7 +142,10 @@ export async function POST(request) {
       return NextResponse.json({ error: `Profile creation failed: ${profileError.message}` }, { status: 500 });
     }
 
-    return NextResponse.json({ member: profile }, { status: 201 });
+    return NextResponse.json(
+      { member: { ...profile, email: newUser.email } },
+      { status: 201 }
+    );
   } catch (e) {
     return NextResponse.json({ error: e.message }, { status: 500 });
   }

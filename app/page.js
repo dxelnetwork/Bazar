@@ -183,14 +183,14 @@ export default function Home() {
     setBusy(false);
   }
 
-  async function syncEntry(row) {
+  async function syncEntry(row, action = 'upsert') {
     try {
       const hdrs = await authHeaders();
       await fetch('/api/sync', {
         method: 'POST',
         headers: hdrs,
         body: JSON.stringify({
-          action: 'upsert',
+          action,
           entry: { ...row, monthId: activeMonth?.id },
           person: profiles.find((p) => p.id === row.user_id)?.name || profile?.name || 'Unknown',
         }),
@@ -213,7 +213,7 @@ export default function Home() {
       setMessage('Entry updated by Admin.');
       setEditing(null);
       await loadData(session.user.id);
-      await syncEntry(editing);
+      await syncEntry(editing, 'update');
     }
     setBusy(false);
   }
@@ -267,7 +267,13 @@ export default function Home() {
       const res = await fetch('/api/admin/members', {
         method: 'POST',
         headers: hdrs,
-        body: JSON.stringify({ name: name.trim(), email: mEmail.trim(), password: mPass, whatsapp: whatsapp.trim() || null }),
+        body: JSON.stringify({
+          name: name.trim(),
+          email: mEmail.trim(),
+          password: mPass,
+          confirmPassword,
+          whatsapp: whatsapp.trim() || null,
+        }),
       });
       const data = await res.json();
       if (!res.ok) {

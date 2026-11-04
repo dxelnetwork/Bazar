@@ -2,7 +2,7 @@
 -- Migration: 001_monthly_cycles.sql
 -- Purpose:   Add monthly bazar cycle management (bazar_months table, close/start
 --            month RPCs, updated RLS policies, profile status column)
--- Safe to run on production databases with existing data.
+-- Safe to run on production databases with existing data. Non-destructive & idempotent.
 -- =============================================================================
 
 -- ---------------------------------------------------------------------------
@@ -24,7 +24,25 @@ CREATE TABLE IF NOT EXISTS bazar_months (
 );
 
 -- ---------------------------------------------------------------------------
--- 2. Add month_id column to bazar_entries (nullable initially for backfill)
+-- 2. Add status column to profiles if not present
+-- ---------------------------------------------------------------------------
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'profiles'
+      AND column_name = 'status'
+  ) THEN
+    ALTER TABLE profiles
+      ADD COLUMN status TEXT NOT NULL DEFAULT 'active'
+      CHECK (status IN ('active', 'inactive'));
+  END IF;
+END;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 3. Add month_id column to bazar_entries (nullable initially for safe backfill)
 -- ---------------------------------------------------------------------------
 DO $$
 BEGIN
@@ -40,54 +58,112 @@ END;
 $$;
 
 -- ---------------------------------------------------------------------------
--- 3. Create initial month & backfill existing entries
---    Only runs if no months exist yet (idempotent).
+-- 4. Safe Backfill Logic for Existing and NULL entries
+--    - Never deletes or overwrites existing data
+--    - Matches entries to existing months by date range first
+--    - Dynamically calculates the reference month from data / CURRENT_DATE
+--    - Ensures an active month exists and associates any orphaned entries
+--    - Enforces NOT NULL only once all entries are guaranteed to have a month_id
 -- ---------------------------------------------------------------------------
 DO $$
 DECLARE
-  v_month_id UUID;
+  v_ref_date DATE;
+  v_start_date DATE;
+  v_end_date DATE;
+  v_month_name TEXT;
+  v_target_month_id UUID;
+  v_null_count INTEGER;
 BEGIN
-  IF NOT EXISTS (SELECT 1 FROM bazar_months LIMIT 1) THEN
-    INSERT INTO bazar_months (month_name, start_date, end_date, status)
-    VALUES ('November 2026', '2026-11-01'::DATE, '2026-11-30'::DATE, 'active')
-    RETURNING id INTO v_month_id;
-
-    UPDATE bazar_entries
-    SET month_id = v_month_id
-    WHERE month_id IS NULL;
+  -- Step A: If months already exist, match unassigned entries by date range
+  IF EXISTS (SELECT 1 FROM bazar_months LIMIT 1) THEN
+    UPDATE bazar_entries e
+    SET month_id = m.id
+    FROM bazar_months m
+    WHERE e.month_id IS NULL
+      AND e.bazar_date >= m.start_date
+      AND e.bazar_date <= m.end_date;
   END IF;
-END;
-$$;
 
--- After backfill, enforce NOT NULL on month_id
--- (Use DO block to make it idempotent – skip if already NOT NULL)
-DO $$
-BEGIN
-  IF EXISTS (
-    SELECT 1 FROM information_schema.columns
-    WHERE table_schema = 'public'
-      AND table_name = 'bazar_entries'
-      AND column_name = 'month_id'
-      AND is_nullable = 'YES'
-  ) THEN
-    ALTER TABLE bazar_entries ALTER COLUMN month_id SET NOT NULL;
+  -- Step B: Check if any entries still have month_id IS NULL
+  SELECT COUNT(*) INTO v_null_count
+  FROM bazar_entries
+  WHERE month_id IS NULL;
+
+  -- If there are NULL entries OR no months exist at all, resolve or create the initial/active month
+  IF v_null_count > 0 OR NOT EXISTS (SELECT 1 FROM bazar_months LIMIT 1) THEN
+
+    -- Look for an existing active month first
+    SELECT id INTO v_target_month_id
+    FROM bazar_months
+    WHERE status = 'active'
+    ORDER BY created_at DESC
+    LIMIT 1;
+
+    -- If no active month exists, determine a safe month dynamically
+    IF v_target_month_id IS NULL THEN
+      -- Pick reference date from latest existing entry, or current date if no entries
+      SELECT COALESCE(MAX(bazar_date), CURRENT_DATE) INTO v_ref_date
+      FROM bazar_entries;
+
+      IF v_ref_date IS NULL THEN
+        v_ref_date := CURRENT_DATE;
+      END IF;
+
+      v_start_date := date_trunc('month', v_ref_date)::DATE;
+      v_end_date := (date_trunc('month', v_ref_date) + INTERVAL '1 month - 1 day')::DATE;
+      v_month_name := trim(to_char(v_ref_date, 'Month YYYY'));
+
+      -- Check if this specific month already exists as closed
+      SELECT id INTO v_target_month_id
+      FROM bazar_months
+      WHERE start_date = v_start_date AND end_date = v_end_date
+      LIMIT 1;
+
+      -- If it doesn't exist, create it as the active month
+      IF v_target_month_id IS NULL THEN
+        INSERT INTO bazar_months (month_name, start_date, end_date, status)
+        VALUES (v_month_name, v_start_date, v_end_date, 'active')
+        RETURNING id INTO v_target_month_id;
+      END IF;
+    END IF;
+
+    -- Step C: Assign any remaining NULL entries to the target month
+    IF v_target_month_id IS NOT NULL THEN
+      UPDATE bazar_entries
+      SET month_id = v_target_month_id
+      WHERE month_id IS NULL;
+    END IF;
+
+  END IF;
+
+  -- Step D: Safely enforce NOT NULL on month_id only if 0 NULL rows remain
+  IF NOT EXISTS (SELECT 1 FROM bazar_entries WHERE month_id IS NULL) THEN
+    IF EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'bazar_entries'
+        AND column_name = 'month_id'
+        AND is_nullable = 'YES'
+    ) THEN
+      ALTER TABLE bazar_entries ALTER COLUMN month_id SET NOT NULL;
+    END IF;
   END IF;
 END;
 $$;
 
 -- ---------------------------------------------------------------------------
--- 4. Unique constraint: only ONE month can have status='active' at a time
+-- 5. Unique constraint: only ONE month can have status='active' at a time
 -- ---------------------------------------------------------------------------
 CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_month
 ON bazar_months (status) WHERE status = 'active';
 
 -- ---------------------------------------------------------------------------
--- 5. Index on bazar_entries.month_id for fast lookups
+-- 6. Index on bazar_entries.month_id for fast lookups
 -- ---------------------------------------------------------------------------
 CREATE INDEX IF NOT EXISTS idx_entries_month ON bazar_entries(month_id);
 
 -- ---------------------------------------------------------------------------
--- 6. RLS for bazar_months
+-- 7. RLS for bazar_months
 -- ---------------------------------------------------------------------------
 ALTER TABLE bazar_months ENABLE ROW LEVEL SECURITY;
 
@@ -107,10 +183,8 @@ CREATE POLICY "months admin update" ON bazar_months FOR UPDATE
   USING (public.is_admin())
   WITH CHECK (public.is_admin());
 
--- No DELETE policy → nobody can delete months
-
 -- ---------------------------------------------------------------------------
--- 7. Helper function: check if a month is active
+-- 8. Helper function: check if a month is active
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.is_month_active(mid UUID)
 RETURNS BOOLEAN
@@ -123,7 +197,7 @@ AS $$
 $$;
 
 -- ---------------------------------------------------------------------------
--- 8. Update bazar_entries INSERT policy to enforce active-month check
+-- 9. Update bazar_entries INSERT policy to enforce active-month check
 -- ---------------------------------------------------------------------------
 DROP POLICY IF EXISTS "entries own or admin insert" ON bazar_entries;
 DROP POLICY IF EXISTS "entries authenticated insert" ON bazar_entries;
@@ -136,25 +210,9 @@ CREATE POLICY "entries own or admin insert active month" ON bazar_entries FOR IN
   );
 
 -- ---------------------------------------------------------------------------
--- 9. Add status column to profiles
--- ---------------------------------------------------------------------------
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM information_schema.columns
-    WHERE table_schema = 'public'
-      AND table_name = 'profiles'
-      AND column_name = 'status'
-  ) THEN
-    ALTER TABLE profiles
-      ADD COLUMN status TEXT NOT NULL DEFAULT 'active'
-      CHECK (status IN ('active', 'inactive'));
-  END IF;
-END;
-$$;
-
--- ---------------------------------------------------------------------------
--- 10. RPC: close_month
+-- 10. RPC: close_month (Consistent calculation with dashboard settlement)
+--     Counts all active members (including those with 0 spending).
+--     Stored totals, member count, per-person share, and snapshot agree.
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.close_month(
   p_month_id UUID,
@@ -176,7 +234,7 @@ BEGIN
     RAISE EXCEPTION 'Only admin can close a month';
   END IF;
 
-  -- Get and lock the month
+  -- Lock the month record
   SELECT * INTO v_month FROM bazar_months WHERE id = p_month_id FOR UPDATE;
 
   IF v_month IS NULL THEN
@@ -187,22 +245,38 @@ BEGIN
     RAISE EXCEPTION 'Month is already closed';
   END IF;
 
-  -- Calculate totals
-  SELECT COALESCE(SUM(amount), 0) INTO v_total
+  -- 1. Calculate actual monthly total expenditure
+  SELECT ROUND(COALESCE(SUM(amount), 0), 2) INTO v_total
   FROM bazar_entries WHERE month_id = p_month_id;
 
-  -- Count distinct active members who participated
-  SELECT COUNT(DISTINCT user_id) INTO v_members
-  FROM bazar_entries WHERE month_id = p_month_id;
+  -- 2. Count active participating members
+  --    In shared-bazar accounting, expenses are split among all active household members,
+  --    including members with zero spending for the month.
+  SELECT COUNT(*) INTO v_members
+  FROM profiles
+  WHERE status = 'active';
 
-  -- If no members participated, use 1 to avoid division by zero
-  IF v_members = 0 THEN
+  -- Fallbacks if profiles table has no rows or status column not yet marked
+  IF v_members IS NULL OR v_members = 0 THEN
+    SELECT COUNT(*) INTO v_members FROM profiles;
+  END IF;
+
+  -- If snapshot provides a validated member list, respect that count
+  IF (v_members IS NULL OR v_members = 0) AND p_settlement_snapshot IS NOT NULL THEN
+    IF p_settlement_snapshot ? 'members' AND jsonb_array_length(p_settlement_snapshot->'members') > 0 THEN
+      v_members := jsonb_array_length(p_settlement_snapshot->'members');
+    END IF;
+  END IF;
+
+  -- Ensure divisor is at least 1
+  IF v_members IS NULL OR v_members = 0 THEN
     v_members := 1;
   END IF;
 
+  -- 3. Calculate equal share per active member
   v_share := ROUND(v_total / v_members, 2);
 
-  -- Update the month
+  -- 4. Save permanent immutable snapshot and close month
   UPDATE bazar_months SET
     status = 'closed',
     total_amount = v_total,
