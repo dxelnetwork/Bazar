@@ -348,15 +348,14 @@ export default function Home() {
         setShowCloseModal(false);
         await loadData(session.user.id);
 
-        // Sync monthly summary to sheets
+        // Sync monthly summary to sheets using closed monthId
         try {
           await fetch('/api/sync', {
             method: 'POST',
             headers: hdrs,
             body: JSON.stringify({
               action: 'monthlySummary',
-              monthName: activeMonth.month_name,
-              snapshot,
+              monthId: activeMonth.id,
             }),
           });
         } catch (_) {}

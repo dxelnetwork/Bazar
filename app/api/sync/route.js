@@ -10,11 +10,21 @@ import { createAdminClient } from '../../../lib/supabaseAdmin.js';
  * Security Model:
  *  - All requests require a valid Supabase Bearer token.
  *  - 'delete', 'update', and 'monthlySummary' actions strictly require Admin authorization.
+ *  - 'update' action:
+ *      * Fetches the database entry strictly by ID.
+ *      * Rejects with 404/500 if non-existent or query fails.
+ *      * Never falls back to client-provided data.
+ *      * Uses only canonical database values.
+ *  - 'monthlySummary' action:
+ *      * Accepts a monthId.
+ *      * Fetches the closed month and its stored settlement_snapshot directly from Supabase.
+ *      * Verifies that the month is closed.
+ *      * Generates the Google Sheets summary solely from the database snapshot.
  *  - 'upsert' action:
  *      * Fetches the actual entry from Supabase using the supplied entry ID.
  *      * Verifies that the database entry exists and belongs to the authenticated user (for members).
  *      * Verifies that the entry's actual month_id belongs to an active month in bazar_months.
- *      * Syncs canonical database values (user_id, amount, item, date, month_id) rather than trusting client-supplied values.
+ *      * Syncs canonical database values (user_id, amount, item, date, month_id).
  *      * Rejects missing, mismatched, or unauthorized entries.
  */
 export async function POST(req) {
@@ -39,7 +49,7 @@ export async function POST(req) {
     const isAdmin = profile?.role === 'admin';
 
     const body = await req.json();
-    const { action = 'upsert', entry, person, monthName, snapshot } = body;
+    const { action = 'upsert', entry, person, monthId } = body;
 
     // 3. Admin-only actions: 'delete', 'update', 'monthlySummary'
     if (action === 'delete' || action === 'update' || action === 'monthlySummary') {
@@ -50,19 +60,62 @@ export async function POST(req) {
         );
       }
 
+      // Action: monthlySummary
       if (action === 'monthlySummary') {
-        if (!snapshot) {
-          return NextResponse.json({ error: 'snapshot data is required' }, { status: 400 });
+        const targetMonthId = monthId || body.month_id;
+        if (!targetMonthId) {
+          return NextResponse.json(
+            { error: 'monthId is required for monthlySummary' },
+            { status: 400 }
+          );
         }
+
+        // Fetch closed month and its stored settlement_snapshot directly from database
+        const { data: dbMonth, error: monthErr } = await adminClient
+          .from('bazar_months')
+          .select('id, month_name, status, total_amount, total_members, per_person_share, settlement_snapshot, closed_at')
+          .eq('id', targetMonthId)
+          .single();
+
+        if (monthErr) {
+          return NextResponse.json(
+            { error: `Database error querying month: ${monthErr.message}` },
+            { status: 500 }
+          );
+        }
+
+        if (!dbMonth) {
+          return NextResponse.json(
+            { error: 'Monthly cycle not found in database' },
+            { status: 404 }
+          );
+        }
+
+        if (dbMonth.status !== 'closed') {
+          return NextResponse.json(
+            { error: `Cannot generate summary: Month '${dbMonth.month_name}' is not closed.` },
+            { status: 400 }
+          );
+        }
+
+        const storedSnapshot = dbMonth.settlement_snapshot || {};
+        const totalAmount = Number(dbMonth.total_amount ?? storedSnapshot.settlement?.total ?? 0);
+        const membersCount = dbMonth.total_members ?? storedSnapshot.members?.length ?? 0;
+        const shareAmount = Number(dbMonth.per_person_share ?? storedSnapshot.settlement?.share ?? 0);
+        const closeDate = dbMonth.closed_at
+          ? dbMonth.closed_at.slice(0, 10)
+          : new Date().toISOString().slice(0, 10);
+
         await appendEntry({
-          id: `SUMMARY-${monthName || 'unknown'}`,
-          bazar_date: snapshot.closed_at ? snapshot.closed_at.slice(0, 10) : new Date().toISOString().slice(0, 10),
+          id: `SUMMARY-${dbMonth.id}`,
+          bazar_date: closeDate,
           person: profile?.name || 'Admin',
-          item: `Monthly Summary: ${monthName || 'N/A'}`,
+          item: `Monthly Summary: ${dbMonth.month_name}`,
           category: 'SUMMARY',
-          amount: Number(snapshot.settlement?.total || 0),
-          notes: `Members: ${snapshot.members?.length || 0}, Per Person Share: €${Number(snapshot.settlement?.share || 0).toFixed(2)}`,
+          amount: totalAmount,
+          notes: `Total Members: ${membersCount}, Per Person Share: €${shareAmount.toFixed(2)}`,
         });
+
         return NextResponse.json({ ok: true });
       }
 
@@ -70,35 +123,59 @@ export async function POST(req) {
         return NextResponse.json({ error: 'Entry id is required' }, { status: 400 });
       }
 
+      // Action: delete
       if (action === 'delete') {
         await deleteEntry(entry.id);
         return NextResponse.json({ ok: true });
       }
 
+      // Action: update (Admin only)
       if (action === 'update') {
-        // Fetch canonical entry from database to ensure verified values
-        const { data: dbEntry } = await adminClient
+        // Fetch database entry strictly by ID
+        const { data: dbEntry, error: queryErr } = await adminClient
           .from('bazar_entries')
           .select('id, user_id, month_id, bazar_date, item, category, amount, notes')
           .eq('id', entry.id)
           .single();
 
-        const updateData = dbEntry || entry;
-        let personName = person || 'Admin';
-        if (updateData.user_id) {
+        if (queryErr) {
+          return NextResponse.json(
+            { error: `Database error querying entry: ${queryErr.message}` },
+            { status: 500 }
+          );
+        }
+
+        if (!dbEntry) {
+          return NextResponse.json(
+            { error: 'Entry not found in database. Cannot sync non-existent entry.' },
+            { status: 404 }
+          );
+        }
+
+        // Fetch canonical profile name for the entry's user
+        let personName = 'Admin';
+        if (dbEntry.user_id) {
           const { data: p } = await adminClient
             .from('profiles')
             .select('name')
-            .eq('id', updateData.user_id)
+            .eq('id', dbEntry.user_id)
             .single();
           if (p?.name) personName = p.name;
         }
 
+        // Use ONLY canonical database values — never fall back to client-provided data
         await updateEntry({
-          ...updateData,
-          amount: Number(updateData.amount),
+          id: dbEntry.id,
+          bazar_date: dbEntry.bazar_date,
           person: personName,
+          item: dbEntry.item,
+          category: dbEntry.category || '',
+          amount: Number(dbEntry.amount),
+          notes: dbEntry.notes || '',
+          month_id: dbEntry.month_id,
+          user_id: dbEntry.user_id,
         });
+
         return NextResponse.json({ ok: true });
       }
     }
@@ -119,7 +196,14 @@ export async function POST(req) {
         .eq('id', entry.id)
         .single();
 
-      if (entryErr || !dbEntry) {
+      if (entryErr) {
+        return NextResponse.json(
+          { error: `Database error querying entry: ${entryErr.message}` },
+          { status: 500 }
+        );
+      }
+
+      if (!dbEntry) {
         return NextResponse.json(
           { error: 'Entry not found in database. Cannot sync uncommitted entry.' },
           { status: 404 }
@@ -158,7 +242,14 @@ export async function POST(req) {
         .eq('id', dbEntry.month_id)
         .single();
 
-      if (monthErr || !month) {
+      if (monthErr) {
+        return NextResponse.json(
+          { error: `Database error querying month: ${monthErr.message}` },
+          { status: 500 }
+        );
+      }
+
+      if (!month) {
         return NextResponse.json(
           { error: 'Referenced monthly cycle does not exist' },
           { status: 404 }
