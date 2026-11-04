@@ -60,7 +60,8 @@ $$;
 -- ---------------------------------------------------------------------------
 -- 4. Safe & Accurate Backfill Logic for Existing and Historical Entries
 --    - Never deletes, truncates, or overwrites existing entries.
---    - Validates no entries have NULL bazar_date.
+--    - Validates existing non-NULL month_id references and date ranges.
+--    - Never silently rewrites historical associations.
 --    - Accurately groups historical entries by their true calendar month.
 --    - Creates closed months for past periods and keeps at most one active month.
 --    - Stops with a descriptive error if any date overlap or ambiguity exists.
@@ -69,6 +70,8 @@ $$;
 DO $$
 DECLARE
   v_null_date_count INTEGER;
+  v_invalid_fk_count INTEGER;
+  v_out_of_range_count INTEGER;
   v_ambiguous_count INTEGER;
   v_remaining_null INTEGER;
   v_has_active_month BOOLEAN;
@@ -86,7 +89,28 @@ BEGIN
     RAISE EXCEPTION 'Cannot backfill: % entries have NULL bazar_date. Please populate valid dates before running migration.', v_null_date_count;
   END IF;
 
-  -- Check 2: Check for ambiguous overlap with multiple existing months
+  -- Check 2: Inspect existing non-NULL month_id values for invalid foreign key references
+  SELECT COUNT(*) INTO v_invalid_fk_count
+  FROM bazar_entries e
+  WHERE e.month_id IS NOT NULL
+    AND NOT EXISTS (SELECT 1 FROM bazar_months m WHERE m.id = e.month_id);
+
+  IF v_invalid_fk_count > 0 THEN
+    RAISE EXCEPTION 'Cannot migrate: % entries have non-NULL month_id referencing non-existent months. Please resolve invalid references before running migration.', v_invalid_fk_count;
+  END IF;
+
+  -- Check 3: Inspect existing non-NULL month_id values for dates outside assigned month range
+  SELECT COUNT(*) INTO v_out_of_range_count
+  FROM bazar_entries e
+  JOIN bazar_months m ON m.id = e.month_id
+  WHERE e.month_id IS NOT NULL
+    AND (e.bazar_date < m.start_date OR e.bazar_date > m.end_date);
+
+  IF v_out_of_range_count > 0 THEN
+    RAISE EXCEPTION 'Cannot migrate: % entries with existing month_id have bazar_date outside their assigned month date range. Please resolve mismatched dates manually; historical associations will not be silently rewritten.', v_out_of_range_count;
+  END IF;
+
+  -- Check 4: Check for ambiguous overlap with multiple existing months for unassigned entries
   SELECT COUNT(*) INTO v_ambiguous_count
   FROM bazar_entries e
   WHERE e.month_id IS NULL
@@ -468,3 +492,20 @@ BEGIN
   RETURN v_new_id;
 END;
 $$;
+
+-- ---------------------------------------------------------------------------
+-- 12. Explicitly restrict EXECUTE permissions for SECURITY DEFINER RPC functions
+--     Revokes execution from PUBLIC/anon; grants to authenticated users only.
+--     Internal role checks ensure only Admins can execute administrative logic.
+-- ---------------------------------------------------------------------------
+REVOKE ALL ON FUNCTION public.is_admin() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.is_admin() TO authenticated;
+
+REVOKE ALL ON FUNCTION public.is_month_active(UUID) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.is_month_active(UUID) TO authenticated;
+
+REVOKE ALL ON FUNCTION public.close_month(UUID, JSONB) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.close_month(UUID, JSONB) TO authenticated;
+
+REVOKE ALL ON FUNCTION public.start_new_month(TEXT, DATE, DATE) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.start_new_month(TEXT, DATE, DATE) TO authenticated;

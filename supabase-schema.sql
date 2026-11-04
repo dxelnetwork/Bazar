@@ -326,3 +326,16 @@ select e.id, e.month_id, e.user_id, p.name as person, e.bazar_date, e.item, e.ca
        e.amount, e.notes, e.created_at, e.updated_at
 from bazar_entries e
 join profiles p on p.id = e.user_id;
+
+-- 11. Security Definer RPC Execution Permissions
+revoke all on function public.is_admin() from public;
+grant execute on function public.is_admin() to authenticated;
+
+revoke all on function public.is_month_active(uuid) from public;
+grant execute on function public.is_month_active(uuid) to authenticated;
+
+revoke all on function public.close_month(uuid, jsonb) from public;
+grant execute on function public.close_month(uuid, jsonb) to authenticated;
+
+revoke all on function public.start_new_month(text, date, date) from public;
+grant execute on function public.start_new_month(text, date, date) to authenticated;
