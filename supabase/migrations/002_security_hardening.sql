@@ -1,14 +1,20 @@
 -- =============================================================================
--- Migration: 002_security_and_integrity.sql
--- Purpose:   Harden profile privilege security, closed month immutability,
---            UUID-keyed settlement data integrity, and strict RPC permissions.
--- Safe to run on existing production databases. Idempotent & non-destructive.
+-- Migration: 002_security_hardening.sql
+-- Purpose:   Security hardening, profile privilege escalation prevention,
+--            closed month immutability, UUID-based settlements, and
+--            strict RPC execution grants.
+--
+-- TARGET:    Run this migration on databases that already have
+--            001_monthly_cycles.sql applied.
+--
+-- SAFETY:    Idempotent and safe for existing production databases.
+--            Never drops tables, truncates data, or alters existing records.
 -- =============================================================================
 
 -- ---------------------------------------------------------------------------
 -- 1. Profile Security: Prevent Privilege Escalation
---    - Members can only update their own permitted fields (e.g. name, whatsapp)
---    - Members can NEVER change their own role or status
+--    - Members can only update their own profile fields (e.g. name, whatsapp)
+--    - Members cannot change their role, status, or user ID
 --    - Only Admins can modify another user's role or status
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.check_profile_update()
@@ -18,7 +24,7 @@ SECURITY DEFINER
 SET search_path = public
 AS $$
 BEGIN
-  -- If the caller is NOT an admin, forbid modifying role, status, or id
+  -- If caller is not an admin, forbid modifying role, status, or id
   IF NOT public.is_admin() THEN
     IF NEW.role IS DISTINCT FROM OLD.role THEN
       RAISE EXCEPTION 'Privilege escalation denied: Only admin can modify user roles';
@@ -39,16 +45,16 @@ CREATE TRIGGER trg_check_profile_update
 BEFORE UPDATE ON profiles
 FOR EACH ROW EXECUTE FUNCTION public.check_profile_update();
 
--- Update profiles RLS policy to reinforce check
+-- Re-create profiles update policy with explicit USING and WITH CHECK
 DROP POLICY IF EXISTS "profiles self or admin update" ON profiles;
 CREATE POLICY "profiles self or admin update" ON profiles FOR UPDATE
   USING (id = auth.uid() OR public.is_admin())
   WITH CHECK (id = auth.uid() OR public.is_admin());
 
 -- ---------------------------------------------------------------------------
--- 2. Closed Month Immutability: Protect Bazar Entries
---    - Once a month is closed, NO ONE (including Admin) may edit or delete entries
---    - Enforced via both RLS policies and database trigger
+-- 2. Closed Month Immutability: Protect bazar_entries
+--    - Once a month is closed, no one (including Admin) may update or delete entries
+--    - Enforced via both database trigger and RLS policies
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.check_entry_month_active()
 RETURNS TRIGGER
@@ -80,7 +86,7 @@ CREATE TRIGGER trg_check_entry_month_active
 BEFORE UPDATE OR DELETE ON bazar_entries
 FOR EACH ROW EXECUTE FUNCTION public.check_entry_month_active();
 
--- Restrict Admin UPDATE and DELETE policies to active months only
+-- Restrict Admin entry UPDATE and DELETE policies to active months only
 DROP POLICY IF EXISTS "entries admin update" ON bazar_entries;
 DROP POLICY IF EXISTS "entries admin update active month only" ON bazar_entries;
 CREATE POLICY "entries admin update active month only" ON bazar_entries FOR UPDATE
@@ -94,7 +100,9 @@ CREATE POLICY "entries admin delete active month only" ON bazar_entries FOR DELE
 
 -- ---------------------------------------------------------------------------
 -- 3. Closed Month Immutability: Protect bazar_months Records & Snapshots
---    - Closed months and their settlement snapshots cannot be edited or deleted
+--    - Once closed, records and snapshots cannot be altered or deleted
+--    - Prevent direct updates that mark a month closed without the authoritative snapshot
+--    - Direct admin updates can only maintain active status; closing occurs via close_month() RPC
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.check_closed_month_immutable()
 RETURNS TRIGGER
@@ -103,9 +111,18 @@ SECURITY DEFINER
 SET search_path = public
 AS $$
 BEGIN
+  -- 1. Once closed, records and settlement snapshots are permanent and immutable
   IF OLD.status = 'closed' THEN
     RAISE EXCEPTION 'Closed month immutability: Closed month records and settlement snapshots are permanent and cannot be modified';
   END IF;
+
+  -- 2. Prevent marking a month closed without generating the authoritative settlement snapshot
+  IF TG_OP = 'UPDATE' AND NEW.status = 'closed' THEN
+    IF NEW.settlement_snapshot IS NULL OR NEW.closed_at IS NULL OR NEW.closed_by IS NULL THEN
+      RAISE EXCEPTION 'Invalid month closure: Months can only be closed through the close_month() procedure with an authoritative snapshot';
+    END IF;
+  END IF;
+
   RETURN NEW;
 END;
 $$;
@@ -115,18 +132,21 @@ CREATE TRIGGER trg_check_closed_month_immutable
 BEFORE UPDATE OR DELETE ON bazar_months
 FOR EACH ROW EXECUTE FUNCTION public.check_closed_month_immutable();
 
+-- Direct admin updates on bazar_months can only touch active months and maintain active status.
+-- Marking a month closed must be performed through the close_month() RPC.
 DROP POLICY IF EXISTS "months admin update" ON bazar_months;
 CREATE POLICY "months admin update" ON bazar_months FOR UPDATE
   USING (public.is_admin() AND status = 'active')
-  WITH CHECK (public.is_admin());
+  WITH CHECK (public.is_admin() AND status = 'active');
 
 -- ---------------------------------------------------------------------------
--- 4. Server-Side Month Closure & UUID-Keyed Settlement Data Integrity
---    - Rejects month closure if there are no active members
---    - Uses Supabase user UUIDs as keys for totals and balances (handles duplicate names)
+-- 4. Server-Side Month Closure: UUID-Keyed Settlement Data Integrity
 --    - Computes totals, equal share, balances, and transactions 100% server-side
---    - Never trusts client-provided calculations
---    - Saves authoritative immutable snapshot
+--    - Ignores client-supplied settlement calculations
+--    - Rejects month closure if there are no active participating members
+--    - Uses Supabase user UUIDs as primary keys to handle duplicate member names safely
+--    - Generates settlement transactions using IDs and display names
+--    - Saves authoritative snapshot atomically
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.close_month(
   p_month_id UUID,
@@ -188,7 +208,7 @@ BEGIN
   FROM profiles
   WHERE status = 'active';
 
-  -- Reject closure if no active members exist
+  -- Reject month closure if no active members exist
   IF v_members IS NULL OR v_members = 0 THEN
     RAISE EXCEPTION 'Cannot close month: No active members found. At least one active member is required for settlement.';
   END IF;

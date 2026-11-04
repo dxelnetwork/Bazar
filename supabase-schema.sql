@@ -133,9 +133,18 @@ security definer
 set search_path = public
 as $$
 begin
+  -- 1. Once closed, records and settlement snapshots are permanent and cannot be modified
   if old.status = 'closed' then
     raise exception 'Closed month immutability: Closed month records and settlement snapshots are permanent and cannot be modified';
   end if;
+
+  -- 2. Prevent marking a month closed without generating the authoritative settlement snapshot
+  if tg_op = 'UPDATE' and new.status = 'closed' then
+    if new.settlement_snapshot is null or new.closed_at is null or new.closed_by is null then
+      raise exception 'Invalid month closure: Months can only be closed through the close_month() procedure with an authoritative snapshot';
+    end if;
+  end if;
+
   return new;
 end;
 $$;
@@ -156,7 +165,7 @@ create policy "months admin insert" on bazar_months for insert
 drop policy if exists "months admin update" on bazar_months;
 create policy "months admin update" on bazar_months for update
   using (public.is_admin() and status = 'active')
-  with check (public.is_admin());
+  with check (public.is_admin() and status = 'active');
 
 -- -----------------------------------------------------------------------------
 -- 7. Closed Month Immutability: bazar_entries
