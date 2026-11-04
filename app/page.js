@@ -171,57 +171,32 @@ export default function Home() {
       user_id: session.user.id,
       month_id: activeMonth.id,
     };
-    const { data, error } = await supabase
+    const { error } = await supabase
       .from('bazar_entries')
-      .insert(payload)
-      .select()
-      .single();
+      .insert(payload);
     if (error) {
       setMessage(error.message);
     } else {
       setForm(emptyForm);
       setMessage('Entry submitted and locked. Only Admin can change it.');
       await loadData(session.user.id);
-      if (data?.id) {
-        await syncEntry(data);
-      }
     }
     setBusy(false);
-  }
-
-  async function syncEntry(row, action = 'upsert') {
-    try {
-      const hdrs = await authHeaders();
-      await fetch('/api/sync', {
-        method: 'POST',
-        headers: hdrs,
-        body: JSON.stringify({
-          action,
-          entry: { ...row, monthId: activeMonth?.id },
-          person: profiles.find((p) => p.id === row.user_id)?.name || profile?.name || 'Unknown',
-        }),
-      });
-    } catch (e) {
-      console.warn('Sheet sync unavailable', e);
-    }
   }
 
   async function adminSave(e) {
     e.preventDefault();
     if (!isAdmin || !editing) return;
     setBusy(true);
-    const { data, error } = await supabase
+    const { error } = await supabase
       .from('bazar_entries')
       .update({ ...editing, amount: Number(editing.amount) })
-      .eq('id', editing.id)
-      .select()
-      .single();
+      .eq('id', editing.id);
     if (error) setMessage(error.message);
     else {
       setMessage('Entry updated by Admin.');
       setEditing(null);
       await loadData(session.user.id);
-      await syncEntry(data || editing, 'update');
     }
     setBusy(false);
   }
@@ -234,14 +209,6 @@ export default function Home() {
     else {
       setMessage('Entry deleted by Admin.');
       await loadData(session.user.id);
-      try {
-        const hdrs = await authHeaders();
-        await fetch('/api/sync', {
-          method: 'POST',
-          headers: hdrs,
-          body: JSON.stringify({ action: 'delete', entry: { id } }),
-        });
-      } catch (_) {}
     }
     setBusy(false);
   }
@@ -347,18 +314,6 @@ export default function Home() {
         setMessage(`Month "${activeMonth.month_name}" closed successfully!`);
         setShowCloseModal(false);
         await loadData(session.user.id);
-
-        // Sync monthly summary to sheets using closed monthId
-        try {
-          await fetch('/api/sync', {
-            method: 'POST',
-            headers: hdrs,
-            body: JSON.stringify({
-              action: 'monthlySummary',
-              monthId: activeMonth.id,
-            }),
-          });
-        } catch (_) {}
       }
     } catch (_) {
       setMessage('Network error closing month.');

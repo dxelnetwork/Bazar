@@ -27,10 +27,6 @@
    - `NEXT_PUBLIC_SUPABASE_URL`
    - `NEXT_PUBLIC_SUPABASE_ANON_KEY`
    - `SUPABASE_SERVICE_ROLE_KEY` *(Admin service role key from Supabase Project Settings -> API -> `service_role`)*
-   - `GOOGLE_SHEET_ID`
-   - `GOOGLE_SERVICE_ACCOUNT_EMAIL`
-   - `GOOGLE_PRIVATE_KEY`
-   - `GOOGLE_SHEETS_RANGE`
 
 6. **Restart Application**:
    - Click **Restart** in the Node.js application management panel.

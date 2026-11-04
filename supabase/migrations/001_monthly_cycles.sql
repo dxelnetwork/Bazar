@@ -1,7 +1,8 @@
 -- =============================================================================
 -- Migration: 001_monthly_cycles.sql
--- Purpose:   Add monthly bazar cycle management (bazar_months table, close/start
---            month RPCs, updated RLS policies, profile status column)
+-- Purpose:   Monthly bazar cycle management with Supabase as single source of truth
+--            (bazar_months table, close/start month RPCs, RLS policies, active
+--            member restrictions, server-side authoritative settlement snapshots)
 -- Safe to run on production databases with existing data. Non-destructive & idempotent.
 -- =============================================================================
 
@@ -235,29 +236,18 @@ ON bazar_months (status) WHERE status = 'active';
 CREATE INDEX IF NOT EXISTS idx_entries_month ON bazar_entries(month_id);
 
 -- ---------------------------------------------------------------------------
--- 7. RLS for bazar_months
+-- 7. Helper security functions
 -- ---------------------------------------------------------------------------
-ALTER TABLE bazar_months ENABLE ROW LEVEL SECURITY;
+CREATE OR REPLACE FUNCTION public.is_admin()
+RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT EXISTS(SELECT 1 FROM profiles WHERE id = auth.uid() AND role = 'admin');
+$$;
 
--- All authenticated users can read months
-DROP POLICY IF EXISTS "months authenticated read" ON bazar_months;
-CREATE POLICY "months authenticated read" ON bazar_months FOR SELECT
-  USING (auth.uid() IS NOT NULL);
-
--- Only admin can create new months
-DROP POLICY IF EXISTS "months admin insert" ON bazar_months;
-CREATE POLICY "months admin insert" ON bazar_months FOR INSERT
-  WITH CHECK (public.is_admin());
-
--- Only admin can update (close) months
-DROP POLICY IF EXISTS "months admin update" ON bazar_months;
-CREATE POLICY "months admin update" ON bazar_months FOR UPDATE
-  USING (public.is_admin())
-  WITH CHECK (public.is_admin());
-
--- ---------------------------------------------------------------------------
--- 8. Helper function: check if a month is active
--- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.is_month_active(mid UUID)
 RETURNS BOOLEAN
 LANGUAGE sql
@@ -268,8 +258,43 @@ AS $$
   SELECT EXISTS(SELECT 1 FROM bazar_months WHERE id = mid AND status = 'active');
 $$;
 
+CREATE OR REPLACE FUNCTION public.is_active_member(uid UUID)
+RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT EXISTS(SELECT 1 FROM profiles WHERE id = uid AND status = 'active');
+$$;
+
 -- ---------------------------------------------------------------------------
--- 9. Update bazar_entries INSERT policy to enforce active-month check
+-- 8. RLS Policies: bazar_months
+--    - Everyone logged in can read monthly periods
+--    - Only admin can create new months
+--    - Only admin can update months, and only active months can be modified
+-- ---------------------------------------------------------------------------
+ALTER TABLE bazar_months ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "months authenticated read" ON bazar_months;
+CREATE POLICY "months authenticated read" ON bazar_months FOR SELECT
+  USING (auth.uid() IS NOT NULL);
+
+DROP POLICY IF EXISTS "months admin insert" ON bazar_months;
+CREATE POLICY "months admin insert" ON bazar_months FOR INSERT
+  WITH CHECK (public.is_admin());
+
+DROP POLICY IF EXISTS "months admin update" ON bazar_months;
+CREATE POLICY "months admin update" ON bazar_months FOR UPDATE
+  USING (public.is_admin() AND status = 'active')
+  WITH CHECK (public.is_admin());
+
+-- ---------------------------------------------------------------------------
+-- 9. Update bazar_entries RLS Policies
+--    - Members can insert only for themselves, only in active months, and only if active
+--    - Inactive members cannot submit entries
+--    - Members cannot edit or delete submitted entries
+--    - Admin can manage any entry
 -- ---------------------------------------------------------------------------
 DROP POLICY IF EXISTS "entries own or admin insert" ON bazar_entries;
 DROP POLICY IF EXISTS "entries authenticated insert" ON bazar_entries;
@@ -277,18 +302,23 @@ DROP POLICY IF EXISTS "entries own or admin insert active month" ON bazar_entrie
 
 CREATE POLICY "entries own or admin insert active month" ON bazar_entries FOR INSERT
   WITH CHECK (
-    (user_id = auth.uid() OR public.is_admin())
+    (
+      (user_id = auth.uid() AND public.is_active_member(auth.uid()))
+      OR public.is_admin()
+    )
     AND public.is_month_active(month_id)
   );
 
 -- ---------------------------------------------------------------------------
--- 10. RPC: close_month (Authoritative Database Generation)
---     Validates against actual database entries and active profiles.
---     Guarantees totals, member count, share, and snapshot cannot disagree.
+-- 10. RPC: close_month (Pure Server-Side Authoritative Snapshot)
+--     - Computes monthly total, active member count, and equal share in SQL
+--     - Calculates balances and settlement transactions entirely server-side
+--     - Never depends on client-provided calculations or settlement transactions
+--     - Saves permanent immutable snapshot and marks month as closed
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.close_month(
   p_month_id UUID,
-  p_settlement_snapshot JSONB
+  p_settlement_snapshot JSONB DEFAULT NULL
 )
 RETURNS JSONB
 LANGUAGE plpgsql
@@ -308,6 +338,15 @@ DECLARE
   v_profile RECORD;
   v_bal_json JSONB := '{}'::JSONB;
   v_tx_json JSONB := '[]'::JSONB;
+
+  -- Settlement calculation arrays
+  v_debtor_names TEXT[] := '{}';
+  v_debtor_amts NUMERIC[] := '{}';
+  v_creditor_names TEXT[] := '{}';
+  v_creditor_amts NUMERIC[] := '{}';
+  v_d_idx INT := 1;
+  v_c_idx INT := 1;
+  v_tx_amt NUMERIC(12,2);
 BEGIN
   -- 1. Admin verification
   IF NOT public.is_admin() THEN
@@ -386,7 +425,7 @@ BEGIN
   JOIN profiles p ON p.id = e.user_id
   WHERE e.month_id = p_month_id;
 
-  -- 9. Calculate individual balances from actual database totals
+  -- 9. Calculate individual balances directly from database totals
   FOR v_profile IN (SELECT name FROM profiles WHERE status = 'active' ORDER BY name) LOOP
     v_db_spent := COALESCE((v_totals_json->>v_profile.name)::NUMERIC, 0);
     v_bal_json := v_bal_json || jsonb_build_object(
@@ -395,10 +434,49 @@ BEGIN
     );
   END LOOP;
 
-  -- 10. Extract transactions from submitted snapshot if provided
-  IF p_settlement_snapshot IS NOT NULL AND (p_settlement_snapshot->'settlement' ? 'transactions') THEN
-    v_tx_json := p_settlement_snapshot->'settlement'->'transactions';
-  END IF;
+  -- 10. Calculate settlement transactions entirely server-side in PostgreSQL
+  FOR v_profile IN (
+    SELECT p.name, ROUND(COALESCE(spent.total_spent, 0) - v_share, 2) AS bal
+    FROM profiles p
+    LEFT JOIN (
+      SELECT user_id, ROUND(COALESCE(SUM(amount), 0), 2) AS total_spent
+      FROM bazar_entries
+      WHERE month_id = p_month_id
+      GROUP BY user_id
+    ) spent ON spent.user_id = p.id
+    WHERE p.status = 'active'
+    ORDER BY bal ASC
+  ) LOOP
+    IF v_profile.bal < -0.001 THEN
+      v_debtor_names := array_append(v_debtor_names, v_profile.name);
+      v_debtor_amts := array_append(v_debtor_amts, -v_profile.bal);
+    ELSIF v_profile.bal > 0.001 THEN
+      v_creditor_names := array_append(v_creditor_names, v_profile.name);
+      v_creditor_amts := array_append(v_creditor_amts, v_profile.bal);
+    END IF;
+  END LOOP;
+
+  v_d_idx := 1;
+  v_c_idx := 1;
+  WHILE v_d_idx <= COALESCE(array_length(v_debtor_names, 1), 0)
+    AND v_c_idx <= COALESCE(array_length(v_creditor_names, 1), 0) LOOP
+    v_tx_amt := ROUND(LEAST(v_debtor_amts[v_d_idx], v_creditor_amts[v_c_idx]), 2);
+    IF v_tx_amt > 0 THEN
+      v_tx_json := v_tx_json || jsonb_build_array(jsonb_build_object(
+        'from', v_debtor_names[v_d_idx],
+        'to', v_creditor_names[v_c_idx],
+        'amount', v_tx_amt
+      ));
+      v_debtor_amts[v_d_idx] := ROUND(v_debtor_amts[v_d_idx] - v_tx_amt, 2);
+      v_creditor_amts[v_c_idx] := ROUND(v_creditor_amts[v_c_idx] - v_tx_amt, 2);
+    END IF;
+    IF v_debtor_amts[v_d_idx] <= 0.001 THEN
+      v_d_idx := v_d_idx + 1;
+    END IF;
+    IF v_creditor_amts[v_c_idx] <= 0.001 THEN
+      v_c_idx := v_c_idx + 1;
+    END IF;
+  END LOOP;
 
   -- 11. Assemble authoritative snapshot
   v_authoritative_snapshot := jsonb_build_object(
@@ -503,6 +581,9 @@ GRANT EXECUTE ON FUNCTION public.is_admin() TO authenticated;
 
 REVOKE ALL ON FUNCTION public.is_month_active(UUID) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.is_month_active(UUID) TO authenticated;
+
+REVOKE ALL ON FUNCTION public.is_active_member(UUID) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.is_active_member(UUID) TO authenticated;
 
 REVOKE ALL ON FUNCTION public.close_month(UUID, JSONB) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.close_month(UUID, JSONB) TO authenticated;

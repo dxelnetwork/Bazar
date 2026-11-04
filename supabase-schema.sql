@@ -1,6 +1,6 @@
 -- =============================================================================
 -- Complete Schema Reference: Bazar Manager
--- Stack: Next.js, Supabase, PostgreSQL
+-- Stack: Next.js, Supabase, PostgreSQL (Single Source of Truth)
 -- =============================================================================
 
 create extension if not exists pgcrypto;
@@ -15,7 +15,7 @@ create table if not exists profiles (
   created_at timestamptz default now()
 );
 
--- 2. Bazar Months Table (Monthly Cycles)
+-- 2. Bazar Months Table (Monthly Accounting Cycles)
 create table if not exists bazar_months (
   id uuid primary key default gen_random_uuid(),
   month_name text not null,
@@ -68,6 +68,11 @@ returns boolean language sql stable security definer set search_path = public as
   select exists(select 1 from bazar_months where id = mid and status = 'active');
 $$;
 
+create or replace function public.is_active_member(uid uuid)
+returns boolean language sql stable security definer set search_path = public as $$
+  select exists(select 1 from profiles where id = uid and status = 'active');
+$$;
+
 -- 5. RLS Policies: profiles
 drop policy if exists "profiles authenticated read" on profiles;
 create policy "profiles authenticated read" on profiles for select
@@ -89,7 +94,7 @@ create policy "months admin insert" on bazar_months for insert
 
 drop policy if exists "months admin update" on bazar_months;
 create policy "months admin update" on bazar_months for update
-  using (public.is_admin())
+  using (public.is_admin() and status = 'active')
   with check (public.is_admin());
 
 -- 7. RLS Policies: bazar_entries
@@ -100,7 +105,10 @@ create policy "entries authenticated read" on bazar_entries for select
 drop policy if exists "entries own or admin insert active month" on bazar_entries;
 create policy "entries own or admin insert active month" on bazar_entries for insert
   with check (
-    (user_id = auth.uid() or public.is_admin())
+    (
+      (user_id = auth.uid() and public.is_active_member(auth.uid()))
+      or public.is_admin()
+    )
     and public.is_month_active(month_id)
   );
 
@@ -130,7 +138,7 @@ for each row execute function public.set_updated_at();
 -- 9. RPC Functions for Month Management
 create or replace function public.close_month(
   p_month_id uuid,
-  p_settlement_snapshot jsonb
+  p_settlement_snapshot jsonb default null
 )
 returns jsonb
 language plpgsql
@@ -150,6 +158,14 @@ declare
   v_profile record;
   v_bal_json jsonb := '{}'::jsonb;
   v_tx_json jsonb := '[]'::jsonb;
+
+  v_debtor_names text[] := '{}';
+  v_debtor_amts numeric[] := '{}';
+  v_creditor_names text[] := '{}';
+  v_creditor_amts numeric[] := '{}';
+  v_d_idx int := 1;
+  v_c_idx int := 1;
+  v_tx_amt numeric(12,2);
 begin
   if not public.is_admin() then
     raise exception 'Only admin can close a month';
@@ -235,10 +251,49 @@ begin
     );
   end loop;
 
-  -- 8. Extract transactions if passed
-  if p_settlement_snapshot is not null and (p_settlement_snapshot->'settlement' ? 'transactions') then
-    v_tx_json := p_settlement_snapshot->'settlement'->'transactions';
-  end if;
+  -- 8. Authoritative settlement transactions calculated server-side
+  for v_profile in (
+    select p.name, round(coalesce(spent.total_spent, 0) - v_share, 2) as bal
+    from profiles p
+    left join (
+      select user_id, round(coalesce(sum(amount), 0), 2) as total_spent
+      from bazar_entries
+      where month_id = p_month_id
+      group by user_id
+    ) spent on spent.user_id = p.id
+    where p.status = 'active'
+    order by bal asc
+  ) loop
+    if v_profile.bal < -0.001 then
+      v_debtor_names := array_append(v_debtor_names, v_profile.name);
+      v_debtor_amts := array_append(v_debtor_amts, -v_profile.bal);
+    elsif v_profile.bal > 0.001 then
+      v_creditor_names := array_append(v_creditor_names, v_profile.name);
+      v_creditor_amts := array_append(v_creditor_amts, v_profile.bal);
+    end if;
+  end loop;
+
+  v_d_idx := 1;
+  v_c_idx := 1;
+  while v_d_idx <= coalesce(array_length(v_debtor_names, 1), 0)
+    and v_c_idx <= coalesce(array_length(v_creditor_names, 1), 0) loop
+    v_tx_amt := round(least(v_debtor_amts[v_d_idx], v_creditor_amts[v_c_idx]), 2);
+    if v_tx_amt > 0 then
+      v_tx_json := v_tx_json || jsonb_build_array(jsonb_build_object(
+        'from', v_debtor_names[v_d_idx],
+        'to', v_creditor_names[v_c_idx],
+        'amount', v_tx_amt
+      ));
+      v_debtor_amts[v_d_idx] := round(v_debtor_amts[v_d_idx] - v_tx_amt, 2);
+      v_creditor_amts[v_c_idx] := round(v_creditor_amts[v_c_idx] - v_tx_amt, 2);
+    end if;
+    if v_debtor_amts[v_d_idx] <= 0.001 then
+      v_d_idx := v_d_idx + 1;
+    end if;
+    if v_creditor_amts[v_c_idx] <= 0.001 then
+      v_c_idx := v_c_idx + 1;
+    end if;
+  end loop;
 
   -- 9. Authoritative snapshot
   v_authoritative_snapshot := jsonb_build_object(
@@ -333,6 +388,9 @@ grant execute on function public.is_admin() to authenticated;
 
 revoke all on function public.is_month_active(uuid) from public;
 grant execute on function public.is_month_active(uuid) to authenticated;
+
+revoke all on function public.is_active_member(uuid) from public;
+grant execute on function public.is_active_member(uuid) to authenticated;
 
 revoke all on function public.close_month(uuid, jsonb) from public;
 grant execute on function public.close_month(uuid, jsonb) to authenticated;
