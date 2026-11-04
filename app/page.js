@@ -171,14 +171,20 @@ export default function Home() {
       user_id: session.user.id,
       month_id: activeMonth.id,
     };
-    const { error } = await supabase.from('bazar_entries').insert(payload);
+    const { data, error } = await supabase
+      .from('bazar_entries')
+      .insert(payload)
+      .select()
+      .single();
     if (error) {
       setMessage(error.message);
     } else {
       setForm(emptyForm);
       setMessage('Entry submitted and locked. Only Admin can change it.');
       await loadData(session.user.id);
-      await syncEntry({ ...payload, id: 'new' });
+      if (data?.id) {
+        await syncEntry(data);
+      }
     }
     setBusy(false);
   }
@@ -204,16 +210,18 @@ export default function Home() {
     e.preventDefault();
     if (!isAdmin || !editing) return;
     setBusy(true);
-    const { error } = await supabase
+    const { data, error } = await supabase
       .from('bazar_entries')
       .update({ ...editing, amount: Number(editing.amount) })
-      .eq('id', editing.id);
+      .eq('id', editing.id)
+      .select()
+      .single();
     if (error) setMessage(error.message);
     else {
       setMessage('Entry updated by Admin.');
       setEditing(null);
       await loadData(session.user.id);
-      await syncEntry(editing, 'update');
+      await syncEntry(data || editing, 'update');
     }
     setBusy(false);
   }

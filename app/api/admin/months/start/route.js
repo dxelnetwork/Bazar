@@ -23,6 +23,9 @@ export async function POST(request) {
     if (!monthName?.trim()) errors.push('monthName is required');
     if (!startDate) errors.push('startDate is required');
     if (!endDate) errors.push('endDate is required');
+    if (startDate && endDate && new Date(startDate) > new Date(endDate)) {
+      errors.push('startDate must be before or equal to endDate');
+    }
 
     if (errors.length > 0) {
       return NextResponse.json({ error: errors.join(', ') }, { status: 400 });

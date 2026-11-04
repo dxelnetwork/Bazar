@@ -142,6 +142,14 @@ declare
   v_total numeric(12,2);
   v_members integer;
   v_share numeric(12,2);
+  v_members_json jsonb;
+  v_totals_json jsonb;
+  v_entries_json jsonb;
+  v_authoritative_snapshot jsonb;
+  v_db_spent numeric(12,2);
+  v_profile record;
+  v_bal_json jsonb := '{}'::jsonb;
+  v_tx_json jsonb := '[]'::jsonb;
 begin
   if not public.is_admin() then
     raise exception 'Only admin can close a month';
@@ -157,11 +165,11 @@ begin
     raise exception 'Month is already closed';
   end if;
 
-  -- 1. Total expenses
+  -- 1. Canonical total expenditure
   select round(coalesce(sum(amount), 0), 2) into v_total
   from bazar_entries where month_id = p_month_id;
 
-  -- 2. Count active members (shared bazar expenses are split among all active members)
+  -- 2. Count active participating members
   select count(*) into v_members
   from profiles
   where status = 'active';
@@ -170,26 +178,90 @@ begin
     select count(*) into v_members from profiles;
   end if;
 
-  if (v_members is null or v_members = 0) and p_settlement_snapshot is not null then
-    if p_settlement_snapshot ? 'members' and jsonb_array_length(p_settlement_snapshot->'members') > 0 then
-      v_members := jsonb_array_length(p_settlement_snapshot->'members');
-    end if;
-  end if;
-
   if v_members is null or v_members = 0 then
     v_members := 1;
   end if;
 
-  -- 3. Equal share per member
+  -- 3. Canonical equal share
   v_share := round(v_total / v_members, 2);
 
-  -- 4. Update month
+  -- 4. Authoritative members
+  select coalesce(jsonb_agg(jsonb_build_object(
+    'id', p.id,
+    'name', p.name,
+    'role', p.role
+  ) order by p.name), '[]'::jsonb)
+  into v_members_json
+  from profiles p
+  where p.status = 'active';
+
+  -- 5. Authoritative member totals
+  select coalesce(jsonb_object_agg(
+    p.name,
+    coalesce(spent.total_spent, 0)
+  ), '{}'::jsonb)
+  into v_totals_json
+  from profiles p
+  left join (
+    select user_id, round(coalesce(sum(amount), 0), 2) as total_spent
+    from bazar_entries
+    where month_id = p_month_id
+    group by user_id
+  ) spent on spent.user_id = p.id
+  where p.status = 'active';
+
+  -- 6. Authoritative entries
+  select coalesce(jsonb_agg(jsonb_build_object(
+    'id', e.id,
+    'user_id', e.user_id,
+    'person', p.name,
+    'bazar_date', e.bazar_date,
+    'item', e.item,
+    'category', e.category,
+    'amount', e.amount,
+    'notes', e.notes
+  ) order by e.bazar_date desc, e.created_at desc), '[]'::jsonb)
+  into v_entries_json
+  from bazar_entries e
+  join profiles p on p.id = e.user_id
+  where e.month_id = p_month_id;
+
+  -- 7. Authoritative balances
+  for v_profile in (select name from profiles where status = 'active' order by name) loop
+    v_db_spent := coalesce((v_totals_json->>v_profile.name)::numeric, 0);
+    v_bal_json := v_bal_json || jsonb_build_object(
+      v_profile.name,
+      round(v_db_spent - v_share, 2)
+    );
+  end loop;
+
+  -- 8. Extract transactions if passed
+  if p_settlement_snapshot is not null and (p_settlement_snapshot->'settlement' ? 'transactions') then
+    v_tx_json := p_settlement_snapshot->'settlement'->'transactions';
+  end if;
+
+  -- 9. Authoritative snapshot
+  v_authoritative_snapshot := jsonb_build_object(
+    'totals', v_totals_json,
+    'members', v_members_json,
+    'entries', v_entries_json,
+    'settlement', jsonb_build_object(
+      'total', v_total,
+      'share', v_share,
+      'balances', v_bal_json,
+      'transactions', v_tx_json
+    ),
+    'closed_at', now(),
+    'closed_by', auth.uid()
+  );
+
+  -- 10. Update month record
   update bazar_months set
     status = 'closed',
     total_amount = v_total,
     total_members = v_members,
     per_person_share = v_share,
-    settlement_snapshot = p_settlement_snapshot,
+    settlement_snapshot = v_authoritative_snapshot,
     closed_by = auth.uid(),
     closed_at = now()
   where id = p_month_id;
@@ -198,7 +270,8 @@ begin
     'success', true,
     'total', v_total,
     'members', v_members,
-    'share', v_share
+    'share', v_share,
+    'snapshot', v_authoritative_snapshot
   );
 end;
 $$;
@@ -215,15 +288,28 @@ set search_path = public
 as $$
 declare
   v_active_count integer;
+  v_overlap_count integer;
   v_new_id uuid;
 begin
   if not public.is_admin() then
     raise exception 'Only admin can start a new month';
   end if;
 
+  if p_start_date > p_end_date then
+    raise exception 'start_date (%) must be before or equal to end_date (%)', p_start_date, p_end_date;
+  end if;
+
   select count(*) into v_active_count from bazar_months where status = 'active';
   if v_active_count > 0 then
-    raise exception 'An active month already exists. Close it first.';
+    raise exception 'An active month already exists. Close it first before starting a new month.';
+  end if;
+
+  select count(*) into v_overlap_count
+  from bazar_months
+  where not (end_date < p_start_date or start_date > p_end_date);
+
+  if v_overlap_count > 0 then
+    raise exception 'Date range [% to %] overlaps with an existing monthly period', p_start_date, p_end_date;
   end if;
 
   insert into bazar_months (month_name, start_date, end_date, status)
