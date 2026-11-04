@@ -1,64 +1,140 @@
 import { NextResponse } from 'next/server';
 import { appendEntry, updateEntry, deleteEntry } from '../../../lib/sheets';
 import { getAuthenticatedUser } from '../../../lib/serverAuth.js';
+import { createAdminClient } from '../../../lib/supabaseAdmin.js';
 
 /**
  * POST /api/sync
- * Syncs entry data to Google Sheets.
- * Now requires authentication and supports optional monthId and monthlySummary action.
+ * Syncs entry data and monthly cycle summaries to Google Sheets.
  *
- * Actions:
- *   - upsert (default): Appends a new entry row
- *   - update: Appends an update row (with ADMIN UPDATE prefix)
- *   - delete: Deletes the entry row by id
- *   - monthlySummary: Writes a monthly summary row to Google Sheets on month close
+ * Security Model:
+ *  - All requests require a valid Supabase Bearer token.
+ *  - 'delete', 'update', and 'monthlySummary' actions require Admin authorization.
+ *  - 'upsert' action allows:
+ *      * Regular members: can only sync entries they own (user_id === auth.uid())
+ *        and only to the currently active month in bazar_months.
+ *      * Admins: can sync authorized entries across users and cycles.
  */
 export async function POST(req) {
   try {
-    // Authenticate the request
+    // 1. Authenticate user
     const { user, error: authError } = await getAuthenticatedUser(req);
-    if (authError) {
-      return NextResponse.json({ error: authError }, { status: 401 });
+    if (authError || !user) {
+      return NextResponse.json(
+        { error: authError || 'Authentication required' },
+        { status: 401 }
+      );
     }
+
+    // 2. Look up user's profile to verify role
+    const adminClient = createAdminClient();
+    const { data: profile } = await adminClient
+      .from('profiles')
+      .select('id, name, role, status')
+      .eq('id', user.id)
+      .single();
+
+    const isAdmin = profile?.role === 'admin';
 
     const body = await req.json();
     const { action = 'upsert', entry, person, monthId, monthName, snapshot } = body;
 
-    // Handle monthly summary action
-    if (action === 'monthlySummary') {
-      if (!snapshot) {
-        return NextResponse.json({ error: 'snapshot data is required' }, { status: 400 });
+    // 3. Admin-only actions
+    if (action === 'delete' || action === 'update' || action === 'monthlySummary') {
+      if (!isAdmin) {
+        return NextResponse.json(
+          { error: `Forbidden: Admin authorization is required for '${action}'` },
+          { status: 403 }
+        );
       }
-      // Write summary row to Google Sheets
-      await appendEntry({
-        id: `SUMMARY-${monthName || 'unknown'}`,
-        bazar_date: snapshot.closed_at || new Date().toISOString(),
-        person: 'SYSTEM',
-        item: `Monthly Summary: ${monthName || 'N/A'}`,
-        category: 'SUMMARY',
-        amount: snapshot.settlement?.total || 0,
-        notes: `Members: ${snapshot.members?.length || 0}, Share: ${snapshot.settlement?.share || 0}`,
-      });
+
+      if (action === 'monthlySummary') {
+        if (!snapshot) {
+          return NextResponse.json({ error: 'snapshot data is required' }, { status: 400 });
+        }
+        await appendEntry({
+          id: `SUMMARY-${monthName || 'unknown'}`,
+          bazar_date: snapshot.closed_at ? snapshot.closed_at.slice(0, 10) : new Date().toISOString().slice(0, 10),
+          person: profile?.name || 'Admin',
+          item: `Monthly Summary: ${monthName || 'N/A'}`,
+          category: 'SUMMARY',
+          amount: Number(snapshot.settlement?.total || 0),
+          notes: `Members: ${snapshot.members?.length || 0}, Per Person Share: €${Number(snapshot.settlement?.share || 0).toFixed(2)}`,
+        });
+        return NextResponse.json({ ok: true });
+      }
+
+      if (!entry?.id) {
+        return NextResponse.json({ error: 'Entry id is required' }, { status: 400 });
+      }
+
+      if (action === 'delete') {
+        await deleteEntry(entry.id);
+      } else if (action === 'update') {
+        await updateEntry({
+          ...entry,
+          person: person || profile?.name || 'Admin',
+        });
+      }
+
       return NextResponse.json({ ok: true });
     }
 
-    // Existing entry sync actions
-    if (!entry?.id) {
-      return NextResponse.json({ error: 'Entry id is required' }, { status: 400 });
+    // 4. Upsert action
+    if (action === 'upsert') {
+      if (!entry) {
+        return NextResponse.json({ error: 'Entry data is required' }, { status: 400 });
+      }
+
+      const targetMonthId = entry.month_id || monthId;
+
+      // Member security validations
+      if (!isAdmin) {
+        // Enforce ownership: member can only submit for themselves
+        if (entry.user_id && entry.user_id !== user.id) {
+          return NextResponse.json(
+            { error: 'Forbidden: You cannot submit entries for another user' },
+            { status: 403 }
+          );
+        }
+
+        // Enforce active month check
+        if (!targetMonthId) {
+          return NextResponse.json(
+            { error: 'Active month reference is required' },
+            { status: 400 }
+          );
+        }
+
+        const { data: month } = await adminClient
+          .from('bazar_months')
+          .select('id, status')
+          .eq('id', targetMonthId)
+          .single();
+
+        if (!month || month.status !== 'active') {
+          return NextResponse.json(
+            { error: 'Forbidden: Entries can only be submitted to the active month' },
+            { status: 403 }
+          );
+        }
+      }
+
+      // Determine reliable person name
+      const syncPerson = isAdmin
+        ? (person || profile?.name || 'Admin')
+        : (profile?.name || user.email || 'Member');
+
+      await appendEntry({
+        ...entry,
+        user_id: isAdmin ? (entry.user_id || user.id) : user.id,
+        person: syncPerson,
+      });
+
+      return NextResponse.json({ ok: true });
     }
 
-    // Attach monthId to the entry if provided
-    const entryWithMonth = monthId ? { ...entry, monthId } : entry;
-
-    if (action === 'delete') {
-      await deleteEntry(entryWithMonth.id);
-    } else if (action === 'update') {
-      await updateEntry({ ...entryWithMonth, person });
-    } else {
-      await appendEntry({ ...entryWithMonth, person });
-    }
-
-    return NextResponse.json({ ok: true });
+    return NextResponse.json({ error: `Unsupported action: ${action}` }, { status: 400 });
   } catch (e) {
     return NextResponse.json({ error: e.message }, { status: 500 });
   }
